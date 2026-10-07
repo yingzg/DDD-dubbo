@@ -4,9 +4,11 @@ import com.ddd.dubbo.domain.common.time.TimeZoneUtils;
 import com.ddd.dubbo.domain.order.entity.Order;
 import com.ddd.dubbo.domain.order.repository.OrderRepository;
 import com.ddd.dubbo.domain.order.statemachine.OrderStatus;
+import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 
+@Service
 public class OrderService {
 
     private final OrderRepository orderRepository;
