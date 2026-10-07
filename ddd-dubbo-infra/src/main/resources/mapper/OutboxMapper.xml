@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ddd.dubbo.infra.outbox.mapper.OutboxMapper">
+
+    <insert id="insert" parameterType="com.ddd.dubbo.infra.outbox.dataobject.OutboxDO"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO outbox (event_type, payload, status, retry_count, create_time)
+        VALUES (#{eventType}, #{payload}, #{status}, #{retryCount}, #{createTime})
+    </insert>
+
+    <select id="selectPending" resultType="com.ddd.dubbo.infra.outbox.dataobject.OutboxDO">
+        SELECT id, event_type, payload, status, retry_count, create_time
+        FROM outbox
+        WHERE status = 0
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="markSent">
+        UPDATE outbox SET status = 1 WHERE id = #{id}
+    </update>
+
+    <update id="increaseRetry">
+        UPDATE outbox SET retry_count = retry_count + 1 WHERE id = #{id}
+    </update>
+
+</mapper>
