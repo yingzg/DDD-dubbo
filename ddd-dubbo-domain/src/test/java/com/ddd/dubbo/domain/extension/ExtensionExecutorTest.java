@@ -2,7 +2,10 @@ package com.ddd.dubbo.domain.extension;
 
 import com.ddd.dubbo.domain.common.exception.BizException;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationContext;
 
+import java.lang.reflect.Constructor;
 import java.util.Arrays;
 import java.util.List;
 
@@ -43,5 +46,13 @@ class ExtensionExecutorTest {
         assertThrows(BizException.class, () ->
                 executor.match(Arrays.<DiscountExtPt>asList(),
                         DiscountExtPt.class, BizScenario.of("vip", "order", "default")));
+    }
+
+    @Test
+    void applicationContextConstructorIsAutowired() throws Exception {
+        Constructor<ExtensionExecutor> ctor =
+                ExtensionExecutor.class.getConstructor(ApplicationContext.class);
+        assertNotNull(ctor.getAnnotation(Autowired.class),
+                "ApplicationContext 构造器应标注 @Autowired，否则 Spring 默认走 no-arg 导致 NPE");
     }
 }

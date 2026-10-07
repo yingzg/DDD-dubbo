@@ -1,8 +1,10 @@
 package com.ddd.dubbo.domain.extension;
 
 import com.ddd.dubbo.domain.common.exception.BizException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationContext;
 import org.springframework.stereotype.Component;
+import org.springframework.util.ClassUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -20,6 +22,7 @@ public class ExtensionExecutor {
         this.applicationContext = null; // 单测用（match 不依赖容器）
     }
 
+    @Autowired
     public ExtensionExecutor(ApplicationContext applicationContext) {
         this.applicationContext = applicationContext;
     }
@@ -34,7 +37,7 @@ public class ExtensionExecutor {
         T best = null;
         int bestScore = -1;
         for (T ext : exts) {
-            Extension ann = ext.getClass().getAnnotation(Extension.class);
+            Extension ann = ClassUtils.getUserClass(ext.getClass()).getAnnotation(Extension.class);
             if (ann == null) {
                 continue;
             }
