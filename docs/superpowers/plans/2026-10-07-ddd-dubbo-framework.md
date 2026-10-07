@@ -1,90 +1,73 @@
-# ddd-dubbo 框架实施计划
+# ddd-dubbo 框架实施计划（V1，已按全量 docs 对齐）
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 实现 ddd-dubbo 后端业务服务框架——五模块 DDD 分层 + CmdExe/QryExe 用例执行器 + 扩展点机制 + 无状态状态机 + 领域事件 + 统一异常/上下文透传/数据访问/缓存锁/MQ/调度/线程池/可观测等公共治理能力 + 订单示例业务。
+**Goal:** 实现 ddd-dubbo 后端业务服务框架 V1——五模块 DDD 分层 + CmdExe/QryExe + 扩展点 + 无状态状态机 + 领域事件 + 统一异常(Assert+AOP 融合) + 用户上下文透传 + 原生 MyBatis 数据访问 + 缓存锁 + MQ(幂等/重试/死信) + Outbox 本地消息表 + XXL-Job 任务 + 线程池 + OpenTelemetry + 时区工具 + 异步导出 + 订单示例业务。
 
-**Architecture:** Maven 五模块（api 零依赖 → domain 依赖 api → infra 依赖 domain → app/job 依赖 domain+infra），依赖倒置（domain 定义 Repository/Gateway 接口，infra 实现），CQRS 用例执行器 + 扩展点三级路由 + 无状态状态机 + 领域事件异步解耦。
+**Architecture:** Maven 五模块（api 零依赖 → domain 依赖 api+otlp-api → infra 依赖 domain → app/job 依赖 domain+infra），依赖倒置，CQRS 用例执行器 + 扩展点三级路由 + 无状态状态机 + 领域事件(Spring 同步/MQ 异步) + Outbox 最终一致。
 
-**Tech Stack:** Java 8（`maven.compiler.release=8`，JDK 17 编译）+ Spring Boot 2.7.18 + Dubbo 2.7.23 + MyBatis（原生，SQL 显式写 XML）+ Druid + Redisson + Caffeine + RocketMQ 4.9.4 + XXL-Job + TTL(transmittable-thread-local)。
+**Tech Stack:** Java 8（`maven.compiler.release=8`，JDK 17 编译）+ Spring Boot 2.7.18 + Dubbo 2.7.23 + 原生 MyBatis + Druid + Redisson + Caffeine + RocketMQ 4.9.4 + XXL-Job 2.3.1 + transmittable-thread-local + OpenTelemetry API 1.30.0。
 
-**测试策略:** 纯逻辑单测 TDD（JUnit 5 + Mockito，来自 spring-boot-starter-test），不写中间件（Dubbo/Redis/MQ/MySQL）集成测试。
+**测试策略:** 纯逻辑单测 TDD（JUnit 5 + Mockito），不写中间件集成测试。
 
-**包根:** `com.ddd.dubbo`。**坐标:** groupId=`com.ddd.dubbo`，root artifactId=`ddd-dubbo-parent`，version=`1.0.0-SNAPSHOT`。
+**关键对齐决策（已锁定，执行时勿改）:**
+1. `Result` 在 `com.ddd.dubbo.api.result`；`ErrorCode`/异常/`Assert` 在 `com.ddd.dubbo.domain.common.exception`。
+2. 融合 COLA：新增 `Assert` 断言工具（ErrorCode 版）+ AOP 边界统一捕获（pointcut = `@within(ExceptionAnnotation) && @within(DubboService)`）。
+3. 时间字段一律 `Long` 存 UTC 毫秒时间戳（BIGINT），新增 `TimeZoneUtils`。
+4. `UserContext` 不可变（immutable）。
+5. `TraceContext` 读 OpenTelemetry `Span.current()`；`AbstractTask` 手动建 OTel root span（非 UUID）。
+6. 分布式事务：`ChainedTransactionManager` 不实现（反模式），实现 `Outbox` 本地消息表。
+7. 不用 Lombok（手写 getter/setter），不用 MyBatis-Plus。
+8. **分片上传下载（common-file，1486 行设计）→ V2 后置，不在本计划。**
 
 ---
 
 ## 文件结构总览
 
 ```
-/mnt/d/个人项目/ddd-dubbo/
-├── pom.xml                                    # 父 POM（spring-boot-starter-parent 2.7.18）
-├── ddd-dubbo-api/pom.xml
-│   └── src/main/java/com/ddd/dubbo/api/
-│       ├── common/{Result,PageResult,ErrorCode}.java
-│       └── order/
-│           ├── provider/OrderProvider.java
-│           └── model/{req/CreateOrderReq,req/QueryOrderReq,resp/OrderResp}.java
-├── ddd-dubbo-domain/pom.xml
-│   └── src/main/java/com/ddd/dubbo/domain/
-│       ├── exe/{Command,Query,CmdExe,QryExe,CommandBus,QueryBus}.java
-│       ├── extension/{ExtensionPoint,Extension,BizScenario,ExtensionExecutor}.java
-│       ├── statemachine/{StateMachine,Transition,StateMachineBuilder,StateMachineBuilderFactory}.java
-│       ├── common/
-│       │   ├── exception/{BizException,SysException,ExceptionAnnotation,ExceptionAspect}.java
-│       │   ├── context/{UserContext,TraceContext}.java
-│       │   ├── event/{DomainEvent,DomainEventPublisher}.java
-│       │   ├── lock/LockUtil.java
-│       │   ├── cache/LogicalExpireCache.java
-│       │   └── threadpool/ThreadPoolConfig.java
-│       └── order/
-│           ├── entity/Order.java
-│           ├── service/OrderService.java
-│           ├── repository/OrderRepository.java
-│           ├── command/{CreateOrderCommand,QueryOrderCommand}.java
-│           ├── exe/CreateOrderCmdExe.java
-│           ├── extension/{OrderDiscountExtPt,NormalOrderDiscountExt,VipOrderDiscountExt}.java
-│           ├── statemachine/{OrderStatus,OrderEvent,OrderContext}.java
-│           └── exception/OrderErrorCode.java
-│       └── src/test/java/com/ddd/dubbo/domain/...（各 TDD 测试）
-├── ddd-dubbo-infra/pom.xml
-│   ├── src/main/java/com/ddd/dubbo/infra/order/
-│   │   ├── mapper/OrderMapper.java
-│   │   ├── dataobject/OrderDO.java
-│   │   ├── converter/OrderConverter.java
-│   │   └── repository/OrderRepositoryImpl.java
-│   └── src/main/resources/mapper/OrderMapper.xml
-├── ddd-dubbo-app/pom.xml
-│   └── src/main/java/com/ddd/dubbo/app/
-│       ├── StartApplication.java
-│       ├── provider/order/OrderProviderImpl.java
-│       └── config/
-│           ├── DataSourceConfig.java
-│           ├── DubboConfig.java
-│           ├── RedissonConfig.java
-│           ├── LocalCacheConfig.java
-│           ├── RedissonProperties.java
-│           └── filter/{DubboProviderFilter,DubboConsumerFilter}.java
-├── ddd-dubbo-job/pom.xml
-│   └── src/main/java/com/ddd/dubbo/job/
-│       ├── JobStartApplication.java
-│       └── task/AbstractTask.java
-└── docs/  （已存在，详设 + 本计划）
+pom.xml（父，含 otel-api 版本管理）
+ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/
+  result/{Result,PageResult}.java
+  order/{provider/OrderProvider, model/req/CreateOrderReq, model/req/QueryOrderReq, model/resp/OrderResp}.java
+ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/
+  exe/{Command,Query,CmdExe,QryExe,CommandBus,QueryBus}.java
+  extension/{ExtensionPoint,Extension,BizScenario,ExtensionExecutor}.java
+  statemachine/{StateMachine,Transition,StateMachineBuilder,StateMachineBuilderFactory}.java
+  common/exception/{ErrorCode,BizException,SysException,Assert,ErrorCodeEnums,ExceptionAnnotation,ExceptionAspect}.java
+  common/context/{UserContext,TraceContext}.java
+  common/event/{DomainEvent,DomainEventPublisher}.java
+  common/lock/LockUtil.java
+  common/threadpool/ThreadPoolConfig.java
+  common/time/TimeZoneUtils.java
+  outbox/{OutboxEvent,OutboxRepository}.java
+  order/{entity/Order, service/OrderService, repository/OrderRepository,
+         command/{CreateOrderCommand,QueryOrderCommand}, exe/CreateOrderCmdExe,
+         extension/{OrderDiscountExtPt,NormalOrderDiscountExt,VipOrderDiscountExt},
+         statemachine/{OrderStatus,OrderEvent,OrderContext}, exception/OrderErrorCode}.java
+ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/
+  order/{mapper/OrderMapper, dataobject/OrderDO, converter/OrderConverter, repository/OrderRepositoryImpl}.java
+  outbox/{dataobject/OutboxDO, mapper/OutboxMapper, repository/OutboxRepositoryImpl}.java
+  src/main/resources/mapper/{OrderMapper.xml, OutboxMapper.xml}
+ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/
+  StartApplication.java
+  provider/order/OrderProviderImpl.java
+  config/{DataSourceConfig,DubboConfig,RedissonConfig,RedissonProperties,LocalCacheConfig}.java
+  config/filter/{DubboProviderFilter,DubboConsumerFilter}.java
+  mq/{MqProducerTemplate,IdempotentHelper}.java
+  outbox/OutboxRelay.java
+  export/{ExportRequest,ObjectStorageWriter,AbstractExportTask}.java
+  src/main/resources/application.yml
+ddd-dubbo-job/src/main/java/com/ddd/dubbo/job/
+  JobStartApplication.java
+  task/AbstractTask.java
+  src/main/resources/application.yml
 ```
-
-**依赖方向约定（不可违反）:** api 不依赖任何模块；domain 只依赖 api + 开源基础（spring-context/aop、slf4j、redisson、ttl、caffeine）；infra 依赖 domain + mybatis；app/job 依赖 domain + infra + dubbo/rocketmq/xxl-job。
-
-**测试约定:** 单测只放 domain 模块（纯逻辑），依赖 spring-boot-starter-test。api 模块 Result 的测试放 api 模块（引入 junit-jupiter）。
 
 ---
 
-## Task 1: 初始化 git + Maven 五模块骨架
+## Task 1: 五模块 Maven 骨架
 
-**Files:**
-- Create: `pom.xml`（根）
-- Create: `ddd-dubbo-api/pom.xml`、`ddd-dubbo-domain/pom.xml`、`ddd-dubbo-infra/pom.xml`、`ddd-dubbo-app/pom.xml`、`ddd-dubbo-job/pom.xml`
-
-- [ ] **Step 1: 根 POM**
+- [ ] **Step 1: 根 POM**（与已提交版本相比，新增 otel-api 版本管理）
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -92,19 +75,16 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
         <version>2.7.18</version>
         <relativePath/>
     </parent>
-
     <groupId>com.ddd.dubbo</groupId>
     <artifactId>ddd-dubbo-parent</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <packaging>pom</packaging>
-
     <properties>
         <java.version>1.8</java.version>
         <maven.compiler.release>8</maven.compiler.release>
@@ -114,8 +94,8 @@
         <xxl-job.version>2.3.1</xxl-job.version>
         <ttl.version>2.14.2</ttl.version>
         <pagehelper.version>1.4.7</pagehelper.version>
+        <otel.version>1.30.0</otel.version>
     </properties>
-
     <modules>
         <module>ddd-dubbo-api</module>
         <module>ddd-dubbo-domain</module>
@@ -123,312 +103,78 @@
         <module>ddd-dubbo-app</module>
         <module>ddd-dubbo-job</module>
     </modules>
-
     <dependencyManagement>
         <dependencies>
-            <dependency>
-                <groupId>com.ddd.dubbo</groupId>
-                <artifactId>ddd-dubbo-api</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.ddd.dubbo</groupId>
-                <artifactId>ddd-dubbo-domain</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.ddd.dubbo</groupId>
-                <artifactId>ddd-dubbo-infra</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.apache.dubbo</groupId>
-                <artifactId>dubbo-spring-boot-starter</artifactId>
-                <version>${dubbo.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.redisson</groupId>
-                <artifactId>redisson</artifactId>
-                <version>${redisson.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.apache.rocketmq</groupId>
-                <artifactId>rocketmq-spring-boot-starter</artifactId>
-                <version>${rocketmq.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.xuxueli</groupId>
-                <artifactId>xxl-job-core</artifactId>
-                <version>${xxl-job.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.alibaba</groupId>
-                <artifactId>transmittable-thread-local</artifactId>
-                <version>${ttl.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>com.github.pagehelper</groupId>
-                <artifactId>pagehelper-spring-boot-starter</artifactId>
-                <version>${pagehelper.version}</version>
-            </dependency>
+            <dependency><groupId>com.ddd.dubbo</groupId><artifactId>ddd-dubbo-api</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.ddd.dubbo</groupId><artifactId>ddd-dubbo-domain</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>com.ddd.dubbo</groupId><artifactId>ddd-dubbo-infra</artifactId><version>${project.version}</version></dependency>
+            <dependency><groupId>org.apache.dubbo</groupId><artifactId>dubbo-spring-boot-starter</artifactId><version>${dubbo.version}</version></dependency>
+            <dependency><groupId>org.redisson</groupId><artifactId>redisson</artifactId><version>${redisson.version}</version></dependency>
+            <dependency><groupId>org.apache.rocketmq</groupId><artifactId>rocketmq-spring-boot-starter</artifactId><version>${rocketmq.version}</version></dependency>
+            <dependency><groupId>com.xuxueli</groupId><artifactId>xxl-job-core</artifactId><version>${xxl-job.version}</version></dependency>
+            <dependency><groupId>com.alibaba</groupId><artifactId>transmittable-thread-local</artifactId><version>${ttl.version}</version></dependency>
+            <dependency><groupId>com.github.pagehelper</groupId><artifactId>pagehelper-spring-boot-starter</artifactId><version>${pagehelper.version}</version></dependency>
+            <dependency><groupId>io.opentelemetry</groupId><artifactId>opentelemetry-api</artifactId><version>${otel.version}</version></dependency>
         </dependencies>
     </dependencyManagement>
 </project>
 ```
 
-- [ ] **Step 2: api 模块 POM**
+- [ ] **Step 2: 各模块 POM**（api/domain/infra/app/job，与已提交版本相同，仅 domain 增 otel-api、app 增 redis）
+
+domain 模块 POM 增加：
 
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.ddd.dubbo</groupId>
-        <artifactId>ddd-dubbo-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-    </parent>
-    <artifactId>ddd-dubbo-api</artifactId>
-    <name>ddd-dubbo-api</name>
-
-    <dependencies>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-</project>
+<dependency>
+    <groupId>io.opentelemetry</groupId>
+    <artifactId>opentelemetry-api</artifactId>
+</dependency>
 ```
 
-- [ ] **Step 3: domain 模块 POM**
+app 模块 POM 增加：
 
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.ddd.dubbo</groupId>
-        <artifactId>ddd-dubbo-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-    </parent>
-    <artifactId>ddd-dubbo-domain</artifactId>
-    <name>ddd-dubbo-domain</name>
-
-    <dependencies>
-        <dependency>
-            <groupId>com.ddd.dubbo</groupId>
-            <artifactId>ddd-dubbo-api</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-context</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-context-support</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-aop</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.aspectj</groupId>
-            <artifactId>aspectjweaver</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.redisson</groupId>
-            <artifactId>redisson</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.alibaba</groupId>
-            <artifactId>transmittable-thread-local</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-test</artifactId>
-            <scope>test</scope>
-        </dependency>
-    </dependencies>
-</project>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
 ```
 
-- [ ] **Step 4: infra 模块 POM**
+- [ ] **Step 3: 编译验证** → `mvn -q compile`（首次会下载依赖，用较长 timeout）→ BUILD SUCCESS
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.ddd.dubbo</groupId>
-        <artifactId>ddd-dubbo-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-    </parent>
-    <artifactId>ddd-dubbo-infra</artifactId>
-    <name>ddd-dubbo-infra</name>
-
-    <dependencies>
-        <dependency>
-            <groupId>com.ddd.dubbo</groupId>
-            <artifactId>ddd-dubbo-domain</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.mybatis.spring.boot</groupId>
-            <artifactId>mybatis-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.alibaba</groupId>
-            <artifactId>druid</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework</groupId>
-            <artifactId>spring-context</artifactId>
-        </dependency>
-    </dependencies>
-</project>
-```
-
-- [ ] **Step 5: app 模块 POM**
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.ddd.dubbo</groupId>
-        <artifactId>ddd-dubbo-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-    </parent>
-    <artifactId>ddd-dubbo-app</artifactId>
-    <name>ddd-dubbo-app</name>
-
-    <dependencies>
-        <dependency>
-            <groupId>com.ddd.dubbo</groupId>
-            <artifactId>ddd-dubbo-domain</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.ddd.dubbo</groupId>
-            <artifactId>ddd-dubbo-infra</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.dubbo</groupId>
-            <artifactId>dubbo-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.mybatis.spring.boot</groupId>
-            <artifactId>mybatis-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.alibaba</groupId>
-            <artifactId>druid-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.github.pagehelper</groupId>
-            <artifactId>pagehelper-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.redisson</groupId>
-            <artifactId>redisson</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.github.ben-manes.caffeine</groupId>
-            <artifactId>caffeine</artifactId>
-        </dependency>
-    </dependencies>
-</project>
-```
-
-- [ ] **Step 6: job 模块 POM**
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <parent>
-        <groupId>com.ddd.dubbo</groupId>
-        <artifactId>ddd-dubbo-parent</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-    </parent>
-    <artifactId>ddd-dubbo-job</artifactId>
-    <name>ddd-dubbo-job</name>
-
-    <dependencies>
-        <dependency>
-            <groupId>com.ddd.dubbo</groupId>
-            <artifactId>ddd-dubbo-domain</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.ddd.dubbo</groupId>
-            <artifactId>ddd-dubbo-infra</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-web</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.xuxueli</groupId>
-            <artifactId>xxl-job-core</artifactId>
-        </dependency>
-    </dependencies>
-</project>
-```
-
-- [ ] **Step 7: 编译验证**
-
-Run: `mvn -q -pl ddd-dubbo-api,ddd-dubbo-domain,ddd-dubbo-infra,ddd-dubbo-app,ddd-dubbo-job compile`
-Expected: BUILD SUCCESS（模块可能因缺主类而无输出，但 POM 应全部解析成功）
-
-- [ ] **Step 8: 提交**
+- [ ] **Step 4: 提交**
 
 ```bash
-git add pom.xml ddd-dubbo-*/pom.xml .gitignore
-git commit -m "chore: 初始化五模块 Maven 骨架"
+git add pom.xml ddd-dubbo-*/pom.xml
+git commit -m "chore: 五模块骨架（含 otel-api 依赖管理）"
 ```
-
-> 注：若 Step 7 编译因缺 Java 源文件报错，属预期，继续 Task 2 添加源码后再全量编译。请先创建 `.gitignore`（内容 `target/`、`.idea/`、`*.iml`）。
 
 ---
 
-## Task 2: api 统一 Result / PageResult / ErrorCode
+## Task 2: api 统一 Result / PageResult + 订单契约
 
 **Files:**
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/common/Result.java`
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/common/PageResult.java`
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/common/ErrorCode.java`
-- Test: `ddd-dubbo-api/src/test/java/com/ddd/dubbo/api/common/ResultTest.java`
+- `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/result/Result.java`
+- `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/result/PageResult.java`
+- `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/provider/OrderProvider.java`
+- `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/model/req/CreateOrderReq.java`
+- `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/model/req/QueryOrderReq.java`
+- `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/model/resp/OrderResp.java`
+- Test: `ddd-dubbo-api/src/test/java/com/ddd/dubbo/api/result/ResultTest.java`
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 失败测试**
 
 ```java
-package com.ddd.dubbo.api.common;
+package com.ddd.dubbo.api.result;
 
 import org.junit.jupiter.api.Test;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 class ResultTest {
-
     @Test
     void successSetsCodeZeroAndData() {
         Result<String> r = Result.success("ok");
+        assertTrue(r.isSuccess());
         assertEquals(0, r.getCode());
         assertEquals("ok", r.getData());
     }
@@ -436,34 +182,33 @@ class ResultTest {
     @Test
     void failSetsCodeAndMsg() {
         Result<Void> r = Result.fail(2001, "订单不存在");
+        assertFalse(r.isSuccess());
         assertEquals(2001, r.getCode());
         assertEquals("订单不存在", r.getMsg());
-        assertNull(r.getData());
     }
 
     @Test
     void withTraceIdAttachesTraceId() {
-        Result<Void> r = Result.fail(500, "系统异常").withTraceId("t-123");
+        Result<Void> r = Result.fail(5000, "系统异常").withTraceId("t-123");
         assertEquals("t-123", r.getTraceId());
     }
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 2: 运行确认失败** → `mvn -q -pl ddd-dubbo-api test` → FAIL
 
-Run: `mvn -q -pl ddd-dubbo-api test`
-Expected: FAIL（Result 类不存在）
-
-- [ ] **Step 3: 实现 Result / PageResult / ErrorCode**
+- [ ] **Step 3: 实现**
 
 ```java
-package com.ddd.dubbo.api.common;
+package com.ddd.dubbo.api.result;
 
 import java.io.Serializable;
 
-/** 统一响应（纯 POJO，零框架依赖） */
+/** 统一响应模型。code=0 表示成功。纯 POJO，零框架依赖。 */
 public class Result<T> implements Serializable {
     private static final long serialVersionUID = 1L;
+
+    public static final int SUCCESS_CODE = 0;
 
     private int code;
     private String msg;
@@ -472,7 +217,7 @@ public class Result<T> implements Serializable {
 
     public static <T> Result<T> success(T data) {
         Result<T> r = new Result<T>();
-        r.code = 0;
+        r.code = SUCCESS_CODE;
         r.msg = "success";
         r.data = data;
         return r;
@@ -490,6 +235,10 @@ public class Result<T> implements Serializable {
         return this;
     }
 
+    public boolean isSuccess() {
+        return this.code == SUCCESS_CODE;
+    }
+
     public int getCode() { return code; }
     public void setCode(int code) { this.code = code; }
     public String getMsg() { return msg; }
@@ -502,7 +251,7 @@ public class Result<T> implements Serializable {
 ```
 
 ```java
-package com.ddd.dubbo.api.common;
+package com.ddd.dubbo.api.result;
 
 import java.io.Serializable;
 import java.util.List;
@@ -529,48 +278,13 @@ public class PageResult<T> implements Serializable {
 ```
 
 ```java
-package com.ddd.dubbo.api.common;
-
-/** 错误码接口（api 层定义，domain 层用枚举实现） */
-public interface ErrorCode {
-    int getCode();
-    String getMsg();
-}
-```
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `mvn -q -pl ddd-dubbo-api test`
-Expected: PASS（3 个用例）
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add ddd-dubbo-api
-git commit -m "feat(api): 统一 Result/PageResult/ErrorCode"
-```
-
----
-
-## Task 3: api 订单契约（Provider + DTO）
-
-**Files:**
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/provider/OrderProvider.java`
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/model/req/CreateOrderReq.java`
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/model/req/QueryOrderReq.java`
-- Create: `ddd-dubbo-api/src/main/java/com/ddd/dubbo/api/order/model/resp/OrderResp.java`
-
-- [ ] **Step 1: 编写契约类（无单测，编译验证）**
-
-```java
 package com.ddd.dubbo.api.order.provider;
 
-import com.ddd.dubbo.api.common.Result;
+import com.ddd.dubbo.api.result.Result;
 import com.ddd.dubbo.api.order.model.req.CreateOrderReq;
 import com.ddd.dubbo.api.order.model.req.QueryOrderReq;
 import com.ddd.dubbo.api.order.model.resp.OrderResp;
 
-/** 订单 RPC 契约（稳定对外，不随实现变化） */
 public interface OrderProvider {
     Result<OrderResp> createOrder(CreateOrderReq req);
     Result<OrderResp> queryOrder(QueryOrderReq req);
@@ -585,7 +299,6 @@ import java.math.BigDecimal;
 
 public class CreateOrderReq implements Serializable {
     private static final long serialVersionUID = 1L;
-
     private Long userId;
     private String channel;
     private BigDecimal amount;
@@ -606,7 +319,6 @@ import java.io.Serializable;
 
 public class QueryOrderReq implements Serializable {
     private static final long serialVersionUID = 1L;
-
     private Long orderId;
 
     public Long getOrderId() { return orderId; }
@@ -622,12 +334,12 @@ import java.math.BigDecimal;
 
 public class OrderResp implements Serializable {
     private static final long serialVersionUID = 1L;
-
     private Long orderId;
     private Long userId;
     private BigDecimal amount;
     private BigDecimal discount;
     private String status;
+    private Long createdAt;   // UTC 毫秒时间戳
 
     public Long getOrderId() { return orderId; }
     public void setOrderId(Long orderId) { this.orderId = orderId; }
@@ -639,61 +351,71 @@ public class OrderResp implements Serializable {
     public void setDiscount(BigDecimal discount) { this.discount = discount; }
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
+    public Long getCreatedAt() { return createdAt; }
+    public void setCreatedAt(Long createdAt) { this.createdAt = createdAt; }
 }
 ```
 
-- [ ] **Step 2: 编译验证**
+- [ ] **Step 4: 运行确认通过** → PASS
 
-Run: `mvn -q -pl ddd-dubbo-api compile`
-Expected: BUILD SUCCESS
-
-- [ ] **Step 3: 提交**
+- [ ] **Step 5: 提交**
 
 ```bash
 git add ddd-dubbo-api
-git commit -m "feat(api): 订单 RPC 契约与 DTO"
+git commit -m "feat(api): Result/PageResult + 订单契约（Result 在 api.result）"
 ```
 
 ---
 
-## Task 4: domain 异常体系（BizException/SysException/OrderErrorCode）
+## Task 3: domain 异常体系 + Assert 断言工具
 
 **Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/BizException.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/SysException.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/exception/OrderErrorCode.java`
-- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/common/exception/BizExceptionTest.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/ErrorCode.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/BizException.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/SysException.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/Assert.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/ErrorCodeEnums.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/OrderErrorCode.java`
+- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/common/exception/AssertTest.java`
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 失败测试**
 
 ```java
 package com.ddd.dubbo.domain.common.exception;
 
-import com.ddd.dubbo.domain.order.exception.OrderErrorCode;
 import org.junit.jupiter.api.Test;
-
+import java.util.Arrays;
+import java.util.Collections;
 import static org.junit.jupiter.api.Assertions.*;
 
-class BizExceptionTest {
+class AssertTest {
 
     @Test
-    void carriesCodeFromErrorCode() {
+    void notNullThrowsWhenNull() {
+        BizException e = assertThrows(BizException.class, () -> Assert.notNull(null, OrderErrorCode.ORDER_NOT_FOUND));
+        assertEquals(2001, e.getCode());
+    }
+
+    @Test
+    void notNullPassesWhenNotNull() {
+        Assert.notNull("x", OrderErrorCode.ORDER_NOT_FOUND);
+    }
+
+    @Test
+    void isTrueThrowsWhenFalse() {
+        assertThrows(BizException.class, () -> Assert.isTrue(false, OrderErrorCode.STOCK_NOT_ENOUGH));
+    }
+
+    @Test
+    void notEmptyThrowsWhenEmpty() {
+        assertThrows(BizException.class, () -> Assert.notEmpty(Collections.emptyList(), OrderErrorCode.ORDER_STATUS_ERROR));
+    }
+
+    @Test
+    void bizExceptionCarriesCodeAndMsg() {
         BizException e = new BizException(OrderErrorCode.ORDER_NOT_FOUND);
         assertEquals(2001, e.getCode());
         assertEquals("订单不存在", e.getMessage());
-    }
-
-    @Test
-    void carriesExplicitCodeAndMsg() {
-        BizException e = new BizException(2002, "库存不足");
-        assertEquals(2002, e.getCode());
-        assertEquals("库存不足", e.getMessage());
-    }
-
-    @Test
-    void sysExceptionCarriesCode() {
-        SysException e = new SysException(5000, "系统异常", new RuntimeException());
-        assertEquals(5000, e.getCode());
     }
 }
 ```
@@ -705,12 +427,19 @@ class BizExceptionTest {
 ```java
 package com.ddd.dubbo.domain.common.exception;
 
-import com.ddd.dubbo.api.common.ErrorCode;
+/** 错误码接口：错误码分段 0 成功 / 1xxx 参数 / 2xxx 业务 / 5xxx 系统 */
+public interface ErrorCode {
+    int getCode();
+    String getMsg();
+}
+```
 
-/** 业务异常（可预期，带错误码，返回给调用方） */
+```java
+package com.ddd.dubbo.domain.common.exception;
+
+/** 业务异常：可预期、对调用方可见、带业务错误码，不告警 */
 public class BizException extends RuntimeException {
     private static final long serialVersionUID = 1L;
-
     private final int code;
 
     public BizException(ErrorCode errorCode) {
@@ -730,10 +459,9 @@ public class BizException extends RuntimeException {
 ```java
 package com.ddd.dubbo.domain.common.exception;
 
-/** 系统异常（未知异常，统一兜底） */
+/** 系统异常：不可预期、技术故障，msg 模糊化、要告警 */
 public class SysException extends RuntimeException {
     private static final long serialVersionUID = 1L;
-
     private final int code;
 
     public SysException(int code, String msg, Throwable cause) {
@@ -746,10 +474,78 @@ public class SysException extends RuntimeException {
 ```
 
 ```java
-package com.ddd.dubbo.domain.order.exception;
+package com.ddd.dubbo.domain.common.exception;
 
-import com.ddd.dubbo.api.common.ErrorCode;
+import java.util.Collection;
+import java.util.Map;
 
+/** 断言工具（借鉴 COLA Assert 风格，错误码用 ErrorCode 枚举） */
+public final class Assert {
+
+    private Assert() {
+    }
+
+    public static void isTrue(boolean expression, ErrorCode errorCode) {
+        if (!expression) {
+            throw new BizException(errorCode);
+        }
+    }
+
+    public static void isFalse(boolean expression, ErrorCode errorCode) {
+        if (expression) {
+            throw new BizException(errorCode);
+        }
+    }
+
+    public static void notNull(Object object, ErrorCode errorCode) {
+        if (object == null) {
+            throw new BizException(errorCode);
+        }
+    }
+
+    public static void notEmpty(Collection<?> collection, ErrorCode errorCode) {
+        if (collection == null || collection.isEmpty()) {
+            throw new BizException(errorCode);
+        }
+    }
+
+    public static void notEmpty(Map<?, ?> map, ErrorCode errorCode) {
+        if (map == null || map.isEmpty()) {
+            throw new BizException(errorCode);
+        }
+    }
+}
+```
+
+```java
+package com.ddd.dubbo.domain.common.exception;
+
+/** 通用错误码（参数/系统段） */
+public enum ErrorCodeEnums implements ErrorCode {
+    PARAM_IS_EMPTY(1001, "参数不能为空"),
+    PARAM_IS_INVALID(1002, "参数非法"),
+    SYS_ERROR(5000, "系统异常，请稍后重试");
+
+    private final int code;
+    private final String msg;
+
+    ErrorCodeEnums(int code, String msg) {
+        this.code = code;
+        this.msg = msg;
+    }
+
+    @Override
+    public int getCode() { return code; }
+
+    @Override
+    public String getMsg() { return msg; }
+}
+```
+
+```java
+package com.ddd.dubbo.domain.common.exception;
+
+/** 订单域业务错误码（2xxx 业务段） */
 public enum OrderErrorCode implements ErrorCode {
     ORDER_NOT_FOUND(2001, "订单不存在"),
     STOCK_NOT_ENOUGH(2002, "库存不足"),
@@ -771,370 +567,110 @@ public enum OrderErrorCode implements ErrorCode {
 }
 ```
 
-- [ ] **Step 4: 运行确认通过** → `mvn -q -pl ddd-dubbo-domain -am test` → PASS
+- [ ] **Step 4: 运行确认通过** → PASS
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add ddd-dubbo-domain
-git commit -m "feat(domain): 统一异常体系 BizException/SysException/OrderErrorCode"
+git commit -m "feat(domain): 异常体系 + Assert 断言工具（融合 COLA）"
 ```
 
 ---
 
-## Task 5: CmdExe/QryExe + CommandBus/QueryBus（CQRS）
+## Task 4: TimeZoneUtils 时区工具
 
 **Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/exe/{Command,Query,CmdExe,QryExe,CommandBus,QueryBus}.java`
-- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/exe/CommandBusTest.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/time/TimeZoneUtils.java`
+- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/common/time/TimeZoneUtilsTest.java`
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 失败测试**
 
 ```java
-package com.ddd.dubbo.domain.exe;
+package com.ddd.dubbo.domain.common.time;
 
 import org.junit.jupiter.api.Test;
-
-import java.util.HashMap;
-import java.util.Map;
-
 import static org.junit.jupiter.api.Assertions.*;
 
-class CommandBusTest {
-
-    static class CreateCmd implements Command<String> {}
-    static class UpdateCmd implements Command<String> {}
+class TimeZoneUtilsTest {
 
     @Test
-    void routesToMatchingExecutorByGenericType() {
-        CmdExe<CreateCmd, String> createExe = new CmdExe<CreateCmd, String>() {
-            @Override
-            public String execute(CreateCmd cmd) { return "created"; }
-        };
-        CmdExe<UpdateCmd, String> updateExe = new CmdExe<UpdateCmd, String>() {
-            @Override
-            public String execute(UpdateCmd cmd) { return "updated"; }
-        };
-        Map<String, CmdExe> map = new HashMap<String, CmdExe>();
-        map.put("create", createExe);
-        map.put("update", updateExe);
-
-        CommandBus bus = new CommandBus(map);
-
-        assertEquals("created", bus.dispatch(new CreateCmd()));
-        assertEquals("updated", bus.dispatch(new UpdateCmd()));
+    void formatTimestampToShanghai() {
+        long utc = 1640995200000L; // 2022-01-01 00:00:00 UTC
+        assertEquals("2022-01-01 08:00:00", TimeZoneUtils.formatTimestamp(utc, "Asia/Shanghai", "yyyy-MM-dd HH:mm:ss"));
     }
 
     @Test
-    void throwsWhenNoExecutorMatched() {
-        CommandBus bus = new CommandBus(new HashMap<String, CmdExe>());
-        BizException e = assertThrows(BizException.class, () -> bus.dispatch(new CreateCmd()));
-        assertTrue(e.getMessage().contains("未找到命令执行器"));
-    }
-}
-```
-
-- [ ] **Step 2: 运行确认失败** → `mvn -q -pl ddd-dubbo-domain -am test` → FAIL
-
-- [ ] **Step 3: 实现**
-
-```java
-package com.ddd.dubbo.domain.exe;
-
-/** 命令标记接口（写操作，返回结果类型 T） */
-public interface Command<T> {
-}
-```
-
-```java
-package com.ddd.dubbo.domain.exe;
-
-/** 查询标记接口（读操作，返回结果类型 T） */
-public interface Query<T> {
-}
-```
-
-```java
-package com.ddd.dubbo.domain.exe;
-
-/** 命令执行器（写操作） */
-public interface CmdExe<C extends Command<R>, R> {
-    R execute(C cmd);
-}
-```
-
-```java
-package com.ddd.dubbo.domain.exe;
-
-/** 查询执行器（读操作） */
-public interface QryExe<Q extends Query<R>, R> {
-    R execute(Q qry);
-}
-```
-
-```java
-package com.ddd.dubbo.domain.exe;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.springframework.core.ResolvableType;
-import org.springframework.stereotype.Component;
-
-import java.util.Map;
-
-/** 命令分发总线：按泛型自动路由到匹配的 CmdExe */
-@Component
-public class CommandBus {
-
-    private static final int SYS_ERROR = 5000;
-
-    private final Map<String, CmdExe> cmdExes;
-
-    public CommandBus(Map<String, CmdExe> cmdExes) {
-        this.cmdExes = cmdExes;
-    }
-
-    @SuppressWarnings("unchecked")
-    public <T extends Command<R>, R> R dispatch(T command) {
-        for (CmdExe exe : cmdExes.values()) {
-            Class<?> cmdType = ResolvableType.forInstance(exe)
-                    .as(CmdExe.class).getGeneric(0).resolve();
-            if (cmdType != null && cmdType.isInstance(command)) {
-                return (R) exe.execute(command);
-            }
-        }
-        throw new BizException(SYS_ERROR, "未找到命令执行器: " + command.getClass().getName());
-    }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.exe;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.springframework.core.ResolvableType;
-import org.springframework.stereotype.Component;
-
-import java.util.Map;
-
-/** 查询分发总线：按泛型自动路由到匹配的 QryExe */
-@Component
-public class QueryBus {
-
-    private static final int SYS_ERROR = 5000;
-
-    private final Map<String, QryExe> qryExes;
-
-    public QueryBus(Map<String, QryExe> qryExes) {
-        this.qryExes = qryExes;
-    }
-
-    @SuppressWarnings("unchecked")
-    public <T extends Query<R>, R> R dispatch(T query) {
-        for (QryExe exe : qryExes.values()) {
-            Class<?> qryType = ResolvableType.forInstance(exe)
-                    .as(QryExe.class).getGeneric(0).resolve();
-            if (qryType != null && qryType.isInstance(query)) {
-                return (R) exe.execute(query);
-            }
-        }
-        throw new BizException(SYS_ERROR, "未找到查询执行器: " + query.getClass().getName());
-    }
-}
-```
-
-> 注意：`BizException` 已在 Task 4 定义，测试里 import 需正确（`com.ddd.dubbo.domain.common.exception.BizException`）。
-
-- [ ] **Step 4: 运行确认通过** → `mvn -q -pl ddd-dubbo-domain -am test` → PASS
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add ddd-dubbo-domain
-git commit -m "feat(domain): CmdExe/QryExe 用例执行器 + CommandBus/QueryBus 泛型路由"
-```
-
----
-
-## Task 6: 扩展点机制（ExtensionPoint + BizScenario + ExtensionExecutor）
-
-**Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/extension/{ExtensionPoint,Extension,BizScenario,ExtensionExecutor}.java`
-- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/extension/ExtensionExecutorTest.java`
-
-- [ ] **Step 1: 写失败测试**
-
-```java
-package com.ddd.dubbo.domain.extension;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.junit.jupiter.api.Test;
-
-import java.util.Arrays;
-import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-class ExtensionExecutorTest {
-
-    interface DiscountExtPt extends ExtensionPoint {
-        String discount();
-    }
-
-    static class NormalExt implements DiscountExtPt {
-        @Override
-        public String discount() { return "normal"; }
-    }
-
-    static class VipExt implements DiscountExtPt {
-        @Override
-        public String discount() { return "vip"; }
+    void formatTimestampToUtc() {
+        long utc = 1640995200000L;
+        assertEquals("2022-01-01 00:00:00", TimeZoneUtils.formatTimestamp(utc, "UTC", "yyyy-MM-dd HH:mm:ss"));
     }
 
     @Test
-    void routesByBizId() {
-        List<DiscountExtPt> exts = Arrays.<DiscountExtPt>asList(new NormalExt(), new VipExt());
-        ExtensionExecutor executor = new ExtensionExecutor();
-
-        assertEquals("vip", executor.match(exts, new NormalExt().getClass(),
-                BizScenario.of("vip", "order", "default")).discount());
-        assertEquals("normal", executor.match(exts, new NormalExt().getClass(),
-                BizScenario.of("normal", "order", "default")).discount());
+    void emptyWhenInvalid() {
+        assertEquals("", TimeZoneUtils.formatTimestamp(0L, "UTC", "yyyy-MM-dd"));
+        assertEquals("", TimeZoneUtils.formatTimestamp(1640995200000L, "", "yyyy-MM-dd"));
     }
 
     @Test
-    void throwsWhenNoExtension() {
-        ExtensionExecutor executor = new ExtensionExecutor();
-        assertThrows(BizException.class, () ->
-                executor.match(Arrays.<DiscountExtPt>asList(),
-                        new NormalExt().getClass(), BizScenario.of("vip", "order", "default")));
+    void getCurrentUtcTimestampPositive() {
+        assertTrue(TimeZoneUtils.getCurrentUtcTimestamp() > 0);
     }
 }
 ```
-
-> 注：此测试要求 `ExtensionExecutor` 提供一个可单测的 `match(List<T>, Class<T>, BizScenario)` 方法，路由逻辑从 `@Extension` 注解读取 bizId。为让注解信息可被测试，`ExtensionExecutor` 需能反射读取实现类上的 `@Extension` 注解（测试里用静态内部类时注解放在类上即可，本测试用简化的 match 签名，实际实现见 Step 3，测试与实现需对齐）。
 
 - [ ] **Step 2: 运行确认失败** → FAIL
 
 - [ ] **Step 3: 实现**
 
 ```java
-package com.ddd.dubbo.domain.extension;
+package com.ddd.dubbo.domain.common.time;
 
-/** 扩展点标记接口：业务变化点的抽象 */
-public interface ExtensionPoint {
-}
-```
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 
-```java
-package com.ddd.dubbo.domain.extension;
+/** 时区转换工具：统一存储 UTC 毫秒时间戳，展示层按用户时区转换 */
+public final class TimeZoneUtils {
 
-import java.lang.annotation.*;
-
-/** 扩展实现注解：声明该实现适用的业务场景 */
-@Target(ElementType.TYPE)
-@Retention(RetentionPolicy.RUNTIME)
-@Documented
-public @interface Extension {
-    String bizId();
-    String useCase() default "default";
-    String scenario() default "default";
-}
-```
-
-```java
-package com.ddd.dubbo.domain.extension;
-
-/** 业务场景：bizId + useCase + scenario 三级路由 */
-public class BizScenario {
-    public static final String DEFAULT = "default";
-
-    private String bizId;
-    private String useCase;
-    private String scenario;
-
-    public static BizScenario of(String bizId) {
-        return of(bizId, DEFAULT, DEFAULT);
+    private TimeZoneUtils() {
     }
 
-    public static BizScenario of(String bizId, String useCase, String scenario) {
-        BizScenario bs = new BizScenario();
-        bs.bizId = bizId;
-        bs.useCase = useCase;
-        bs.scenario = scenario;
-        return bs;
+    public static long getCurrentUtcTimestamp() {
+        return Instant.now().toEpochMilli();
     }
 
-    public String getBizId() { return bizId; }
-    public String getUseCase() { return useCase; }
-    public String getScenario() { return scenario; }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.extension;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.springframework.context.ApplicationContext;
-import org.springframework.stereotype.Component;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-
-/** 扩展点执行器：按 BizScenario 三级降级路由 */
-@Component
-public class ExtensionExecutor {
-
-    private static final int SYS_ERROR = 5000;
-
-    private final ApplicationContext applicationContext;
-
-    public ExtensionExecutor() {
-        this.applicationContext = null; // 单测用（match 不依赖容器）
-    }
-
-    public ExtensionExecutor(ApplicationContext applicationContext) {
-        this.applicationContext = applicationContext;
-    }
-
-    public <T extends ExtensionPoint> T execute(Class<T> extPtClass, BizScenario scenario) {
-        Map<String, T> exts = applicationContext.getBeansOfType(extPtClass);
-        return match(new ArrayList<T>(exts.values()), extPtClass, scenario);
-    }
-
-    /** 三级降级匹配：bizId+useCase+scenario → bizId+useCase → bizId */
-    public <T extends ExtensionPoint> T match(List<T> exts, Class<T> extPtClass, BizScenario scenario) {
-        T best = null;
-        int bestScore = -1;
-        for (T ext : exts) {
-            Extension ann = ext.getClass().getAnnotation(Extension.class);
-            if (ann == null) {
-                continue;
-            }
-            int score = matchScore(ann, scenario);
-            if (score > bestScore) {
-                bestScore = score;
-                best = ext;
-            }
+    /** 时间戳转指定时区的格式化字符串 */
+    public static String formatTimestamp(long timestamp, String timezoneId, String pattern) {
+        if (timestamp <= 0 || isBlank(timezoneId) || isBlank(pattern)) {
+            return "";
         }
-        if (best == null) {
-            throw new BizException(SYS_ERROR,
-                    "缺少扩展实现: " + extPtClass.getSimpleName() + " for " + scenario.getBizId());
+        try {
+            Instant instant = Instant.ofEpochMilli(timestamp);
+            ZoneId zone = ZoneId.of(timezoneId);
+            LocalDateTime localDateTime = LocalDateTime.ofInstant(instant, zone);
+            return localDateTime.format(DateTimeFormatter.ofPattern(pattern));
+        } catch (Exception e) {
+            return "";
         }
-        return best;
     }
 
-    private int matchScore(Extension ann, BizScenario scenario) {
-        if (!ann.bizId().equals(scenario.getBizId())) {
-            return -1;
+    /** 指定时区的字符串时间转 UTC 时间戳 */
+    public static long parseToTimestamp(String timeStr, String timezoneId, String pattern) {
+        if (isBlank(timeStr) || isBlank(timezoneId) || isBlank(pattern)) {
+            return 0L;
         }
-        if (ann.useCase().equals(scenario.getUseCase()) && ann.scenario().equals(scenario.getScenario())) {
-            return 3;
+        try {
+            LocalDateTime localDateTime = LocalDateTime.parse(timeStr, DateTimeFormatter.ofPattern(pattern));
+            return localDateTime.atZone(ZoneId.of(timezoneId)).toInstant().toEpochMilli();
+        } catch (Exception e) {
+            return 0L;
         }
-        if (ann.useCase().equals(scenario.getUseCase())) {
-            return 2;
-        }
-        return 1;
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
     }
 }
 ```
@@ -1145,251 +681,78 @@ public class ExtensionExecutor {
 
 ```bash
 git add ddd-dubbo-domain
-git commit -m "feat(domain): 扩展点机制 ExtensionPoint + BizScenario 三级路由"
+git commit -m "feat(domain): TimeZoneUtils 时区转换工具（UTC 时间戳）"
 ```
+
+---
+
+## Task 5: CmdExe/QryExe + CommandBus/QueryBus
+
+（代码与上一版计划 Task 5 完全一致，仅 import 路径不变。`BizException` 已在 Task 3 定义。）
+
+- [ ] **Step 1-3: 失败测试 → 实现**（同上一版，`Command`/`Query`/`CmdExe`/`QryExe`/`CommandBus`/`QueryBus`，包 `com.ddd.dubbo.domain.exe`，`CommandBus` 用 `Map<String, CmdExe>` 构造注入 + `ResolvableType` 泛型路由）
+
+- [ ] **Step 4: 运行确认通过** → `mvn -q -pl ddd-dubbo-domain -am test` → PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add ddd-dubbo-domain
+git commit -m "feat(domain): CmdExe/QryExe + CommandBus/QueryBus 泛型路由"
+```
+
+---
+
+## Task 6: 扩展点机制
+
+（代码与上一版计划 Task 6 完全一致，包 `com.ddd.dubbo.domain.extension`，含 `ExtensionPoint`/`Extension`/`BizScenario`/`ExtensionExecutor`）
+
+- [ ] **Step 1-4: TDD 失败 → 实现 → 通过** → PASS
+
+- [ ] **Step 5: 提交** → `git commit -m "feat(domain): 扩展点机制 ExtensionPoint + BizScenario 三级路由"`
 
 ---
 
 ## Task 7: 无状态状态机
 
-**Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/statemachine/{StateMachine,Transition,StateMachineBuilder,StateMachineBuilderFactory}.java`
-- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/statemachine/StateMachineTest.java`
+（代码与上一版计划 Task 7 完全一致，包 `com.ddd.dubbo.domain.statemachine`）
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1-4: TDD** → PASS
 
-```java
-package com.ddd.dubbo.domain.statemachine;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.junit.jupiter.api.Test;
-
-import static org.junit.jupiter.api.Assertions.*;
-
-class StateMachineTest {
-
-    enum S { INIT, PAID }
-    enum E { PAY }
-
-    @Test
-    void firesTransitionAndReturnsTarget() {
-        StateMachineBuilder<S, E, String> builder = StateMachineBuilderFactory.create();
-        builder.transition().from(S.INIT).to(S.PAID).on(E.PAY);
-        StateMachine<S, E, String> sm = builder.build();
-
-        assertEquals(S.PAID, sm.fireEvent(S.INIT, E.PAY, "ctx"));
-    }
-
-    @Test
-    void throwsOnIllegalTransition() {
-        StateMachineBuilder<S, E, String> builder = StateMachineBuilderFactory.create();
-        builder.transition().from(S.INIT).to(S.PAID).on(E.PAY);
-        StateMachine<S, E, String> sm = builder.build();
-
-        assertThrows(BizException.class, () -> sm.fireEvent(S.PAID, E.PAY, "ctx"));
-    }
-
-    @Test
-    void conditionRejectsTransition() {
-        StateMachineBuilder<S, E, Integer> builder = StateMachineBuilderFactory.create();
-        builder.transition().from(S.INIT).to(S.PAID).on(E.PAY)
-                .when(ctx -> ctx > 100);
-        StateMachine<S, E, Integer> sm = builder.build();
-
-        assertThrows(BizException.class, () -> sm.fireEvent(S.INIT, E.PAY, 10));
-        assertEquals(S.PAID, sm.fireEvent(S.INIT, E.PAY, 200));
-    }
-}
-```
-
-- [ ] **Step 2: 运行确认失败** → FAIL
-
-- [ ] **Step 3: 实现**
-
-```java
-package com.ddd.dubbo.domain.statemachine;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-
-import java.util.HashMap;
-import java.util.Map;
-
-/** 无状态状态机：不保存当前状态，每次 fireEvent 传入 from 返回 to */
-public class StateMachine<S, E, C> {
-    private static final int STATE_TRANSITION_ERROR = 5001;
-    private static final int STATE_CONDITION_ERROR = 5002;
-
-    private final Map<S, Map<E, Transition<S, E, C>>> transitions;
-
-    StateMachine(Map<S, Map<E, Transition<S, E, C>>> transitions) {
-        this.transitions = transitions;
-    }
-
-    public S fireEvent(S from, E event, C context) {
-        Map<E, Transition<S, E, C>> map = transitions.get(from);
-        if (map == null || !map.containsKey(event)) {
-            throw new BizException(STATE_TRANSITION_ERROR, "非法状态流转: " + from + " -> " + event);
-        }
-        Transition<S, E, C> t = map.get(event);
-        if (t.getCondition() != null && !t.getCondition().test(context)) {
-            throw new BizException(STATE_CONDITION_ERROR, "状态流转条件不满足");
-        }
-        if (t.getAction() != null) {
-            t.getAction().execute(context);
-        }
-        return t.getTo();
-    }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.statemachine;
-
-import java.util.function.Consumer;
-import java.util.function.Predicate;
-
-/** 状态转移定义 */
-public class Transition<S, E, C> {
-    private final S from;
-    private final S to;
-    private final E event;
-    private Predicate<C> condition;
-    private Consumer<C> action;
-
-    Transition(S from, S to, E event) {
-        this.from = from;
-        this.to = to;
-        this.event = event;
-    }
-
-    public S getFrom() { return from; }
-    public S getTo() { return to; }
-    public E getEvent() { return event; }
-    public Predicate<C> getCondition() { return condition; }
-    public void setCondition(Predicate<C> condition) { this.condition = condition; }
-    public Consumer<C> getAction() { return action; }
-    public void setAction(Consumer<C> action) { this.action = action; }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.statemachine;
-
-import java.util.HashMap;
-import java.util.Map;
-
-/** 状态机构建器 */
-public class StateMachineBuilder<S, E, C> {
-
-    private final Map<S, Map<E, Transition<S, E, C>>> transitions = new HashMap<S, Map<E, Transition<S, E, C>>>();
-
-    public TransitionBuilder transition() {
-        return new TransitionBuilder();
-    }
-
-    public StateMachine<S, E, C> build() {
-        return new StateMachine<S, E, C>(transitions);
-    }
-
-    public class TransitionBuilder {
-        private S from;
-        private S to;
-        private E event;
-        private java.util.function.Predicate<C> condition;
-        private java.util.function.Consumer<C> action;
-
-        public TransitionBuilder from(S from) { this.from = from; return this; }
-        public TransitionBuilder to(S to) { this.to = to; return this; }
-        public TransitionBuilder on(E event) { this.event = event; return this; }
-
-        public TransitionBuilder when(java.util.function.Predicate<C> condition) {
-            this.condition = condition;
-            return this;
-        }
-
-        public TransitionBuilder perform(java.util.function.Consumer<C> action) {
-            this.action = action;
-            return this;
-        }
-
-        public StateMachineBuilder<S, E, C> build() {
-            Transition<S, E, C> t = new Transition<S, E, C>(from, to, event);
-            t.setCondition(condition);
-            t.setAction(action);
-            Map<E, Transition<S, E, C>> map = transitions.get(from);
-            if (map == null) {
-                map = new HashMap<E, Transition<S, E, C>>();
-                transitions.put(from, map);
-            }
-            map.put(event, t);
-            return StateMachineBuilder.this;
-        }
-    }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.statemachine;
-
-/** 状态机构建器工厂 */
-public final class StateMachineBuilderFactory {
-
-    private StateMachineBuilderFactory() {
-    }
-
-    public static <S, E, C> StateMachineBuilder<S, E, C> create() {
-        return new StateMachineBuilder<S, E, C>();
-    }
-}
-```
-
-- [ ] **Step 4: 运行确认通过** → PASS
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add ddd-dubbo-domain
-git commit -m "feat(domain): 无状态状态机 StateMachine + Builder"
-```
+- [ ] **Step 5: 提交** → `git commit -m "feat(domain): 无状态状态机 StateMachine + Builder"`
 
 ---
 
-## Task 8: 用户上下文 UserContext + TraceContext
+## Task 8: UserContext（不可变）+ TraceContext（OTel）
 
 **Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/context/{UserContext,TraceContext}.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/context/UserContext.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/context/TraceContext.java`
 - Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/common/context/UserContextTest.java`
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 失败测试**
 
 ```java
 package com.ddd.dubbo.domain.common.context;
 
 import org.junit.jupiter.api.Test;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 class UserContextTest {
 
     @Test
     void setAndGetThenClear() {
-        UserContext ctx = new UserContext();
-        ctx.setUserId(100L);
-        UserContext.set(ctx);
-
+        UserContext.set(UserContext.builder().userId(100L).locale("zh_CN").build());
         assertNotNull(UserContext.get());
         assertEquals(Long.valueOf(100L), UserContext.get().getUserId());
-
+        assertEquals("zh_CN", UserContext.get().getLocale());
         UserContext.clear();
         assertNull(UserContext.get());
     }
 
     @Test
-    void traceContextDefaultsAndOverrides() {
-        assertNull(TraceContext.getTraceId());
-        TraceContext.setTraceId("t-1");
-        assertEquals("t-1", TraceContext.getTraceId());
-        TraceContext.clear();
+    void traceContextReturnsNullWhenNoOtel() {
+        // 无 OTel Agent 时，Span.current() 为 invalid，返回 null
         assertNull(TraceContext.getTraceId());
     }
 }
@@ -1402,42 +765,70 @@ class UserContextTest {
 ```java
 package com.ddd.dubbo.domain.common.context;
 
-/** 用户上下文（ThreadLocal，入口恢复、finally 清理） */
-public class UserContext {
+/** 用户上下文（不可变，ThreadLocal 持有，入口恢复 finally 清理） */
+public final class UserContext {
 
     private static final ThreadLocal<UserContext> HOLDER = new ThreadLocal<UserContext>();
 
-    private Long userId;
-    private String locale;
-    private String timeZone;
-    private String tenantId;
+    private final Long userId;
+    private final String locale;
+    private final String timeZone;
+    private final String tenantId;
+
+    private UserContext(Builder builder) {
+        this.userId = builder.userId;
+        this.locale = builder.locale;
+        this.timeZone = builder.timeZone;
+        this.tenantId = builder.tenantId;
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
 
     public static UserContext get() { return HOLDER.get(); }
     public static void set(UserContext ctx) { HOLDER.set(ctx); }
     public static void clear() { HOLDER.remove(); }
 
     public Long getUserId() { return userId; }
-    public void setUserId(Long userId) { this.userId = userId; }
     public String getLocale() { return locale; }
-    public void setLocale(String locale) { this.locale = locale; }
     public String getTimeZone() { return timeZone; }
-    public void setTimeZone(String timeZone) { this.timeZone = timeZone; }
     public String getTenantId() { return tenantId; }
-    public void setTenantId(String tenantId) { this.tenantId = tenantId; }
+
+    public static final class Builder {
+        private Long userId;
+        private String locale;
+        private String timeZone;
+        private String tenantId;
+
+        public Builder userId(Long userId) { this.userId = userId; return this; }
+        public Builder locale(String locale) { this.locale = locale; return this; }
+        public Builder timeZone(String timeZone) { this.timeZone = timeZone; return this; }
+        public Builder tenantId(String tenantId) { this.tenantId = tenantId; return this; }
+
+        public UserContext build() {
+            return new UserContext(this);
+        }
+    }
 }
 ```
 
 ```java
 package com.ddd.dubbo.domain.common.context;
 
-/** traceId 上下文（与 MDC 配合，供异常切面/日志使用） */
-public class TraceContext {
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
 
-    private static final ThreadLocal<String> TRACE_ID = new ThreadLocal<String>();
+/** traceId 上下文：优先读 OpenTelemetry 当前 Span */
+public final class TraceContext {
 
-    public static String getTraceId() { return TRACE_ID.get(); }
-    public static void setTraceId(String traceId) { TRACE_ID.set(traceId); }
-    public static void clear() { TRACE_ID.remove(); }
+    private TraceContext() {
+    }
+
+    public static String getTraceId() {
+        SpanContext ctx = Span.current().getSpanContext();
+        return ctx != null && ctx.isValid() ? ctx.getTraceId() : null;
+    }
 }
 ```
 
@@ -1447,278 +838,113 @@ public class TraceContext {
 
 ```bash
 git add ddd-dubbo-domain
-git commit -m "feat(domain): UserContext/TraceContext ThreadLocal 上下文"
+git commit -m "feat(domain): UserContext(不可变) + TraceContext(OTel)"
 ```
 
 ---
 
-## Task 9: 领域事件 DomainEvent + DomainEventPublisher
+## Task 9: 领域事件
+
+（`DomainEvent` + `DomainEventPublisher`，包 `com.ddd.dubbo.domain.common.event`。`DomainEventPublisher` 只保留 `publishSync`（Spring 事件）；`publishAsync` 依赖 MQ 模板，通过 Outbox 模式在 app 层实现，见 Task 18）
+
+- [ ] **Step 1-3: 实现 + 编译验证** → SUCCESS
+
+- [ ] **Step 4: 提交** → `git commit -m "feat(domain): 领域事件 DomainEvent + 同步发布器"`
+
+---
+
+## Task 10: LockUtil 分布式锁
+
+（代码与上一版计划 Task 10 一致，包 `com.ddd.dubbo.domain.common.lock`，TDD 用 Mock Redisson）
+
+- [ ] **Step 1-4: TDD** → PASS
+
+- [ ] **Step 5: 提交** → `git commit -m "feat(domain): Redisson 分布式锁 LockUtil"`
+
+---
+
+## Task 11: 线程池配置
+
+（代码与上一版计划 Task 11 一致，包 `com.ddd.dubbo.domain.common.threadpool`）
+
+- [ ] **Step 1-2: 实现 + 编译** → SUCCESS
+
+- [ ] **Step 3: 提交** → `git commit -m "feat(domain): 场景化线程池 + TTL"`
+
+---
+
+## Task 12: Outbox 领域层（OutboxEvent + OutboxRepository 接口）
 
 **Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/event/{DomainEvent,DomainEventPublisher}.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/outbox/OutboxEvent.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/outbox/OutboxRepository.java`
 
-- [ ] **Step 1: 实现（无单测，编译验证）**
+- [ ] **Step 1: 实现**
 
 ```java
-package com.ddd.dubbo.domain.common.event;
+package com.ddd.dubbo.domain.outbox;
 
 import java.io.Serializable;
-import java.util.Date;
-import java.util.UUID;
 
-/** 领域事件基类 */
-public abstract class DomainEvent implements Serializable {
+/** Outbox 事件（领域模型）：业务 + 消息表同库同事务，最终一致 */
+public class OutboxEvent implements Serializable {
     private static final long serialVersionUID = 1L;
 
-    private String eventId;
-    private Date occurredAt;
+    public static final int STATUS_PENDING = 0;
+    public static final int STATUS_SENT = 1;
 
-    public DomainEvent() {
-        this.eventId = UUID.randomUUID().toString().replace("-", "");
-        this.occurredAt = new Date();
-    }
+    private Long id;
+    private String eventType;      // 事件类型，如 ORDER_CREATED
+    private String payload;        // 消息体 JSON
+    private Integer status;        // 0=PENDING 1=SENT
+    private Integer retryCount;    // 重试次数
 
-    public String getEventId() { return eventId; }
-    public Date getOccurredAt() { return occurredAt; }
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public String getEventType() { return eventType; }
+    public void setEventType(String eventType) { this.eventType = eventType; }
+    public String getPayload() { return payload; }
+    public void setPayload(String payload) { this.payload = payload; }
+    public Integer getStatus() { return status; }
+    public void setStatus(Integer status) { this.status = status; }
+    public Integer getRetryCount() { return retryCount; }
+    public void setRetryCount(Integer retryCount) { this.retryCount = retryCount; }
 }
 ```
 
 ```java
-package com.ddd.dubbo.domain.common.event;
+package com.ddd.dubbo.domain.outbox;
 
-import org.springframework.context.ApplicationEventPublisher;
-import org.springframework.stereotype.Component;
+import java.util.List;
 
-/** 领域事件发布器（同步走 Spring 事件，异步走 MQ，MQ 模板在 app 层按需注入） */
-@Component
-public class DomainEventPublisher {
-
-    private final ApplicationEventPublisher applicationEventPublisher;
-
-    public DomainEventPublisher(ApplicationEventPublisher applicationEventPublisher) {
-        this.applicationEventPublisher = applicationEventPublisher;
-    }
-
-    /** 同步发布（同进程监听者立即处理） */
-    public void publishSync(DomainEvent event) {
-        applicationEventPublisher.publishEvent(event);
-    }
+/** Outbox 仓储接口（domain 定义，infra 实现） */
+public interface OutboxRepository {
+    void save(OutboxEvent event);
+    List<OutboxEvent> selectPending(int limit);
+    void markSent(Long id);
+    void increaseRetry(Long id);
 }
 ```
 
-> 说明：异步发布依赖 MQ 模板（RocketMQ），为避免 domain 依赖 rocketmq，异步发布封装成可选接口，由 app 层注入实现（见 Task 18 的 MqEventPublisher）。domain 只保留同步发布。
+- [ ] **Step 2: 编译验证** → SUCCESS
 
-- [ ] **Step 2: 编译验证** → `mvn -q -pl ddd-dubbo-domain -am compile` → SUCCESS
-
-- [ ] **Step 3: 提交**
-
-```bash
-git add ddd-dubbo-domain
-git commit -m "feat(domain): 领域事件 DomainEvent + 同步发布器"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(domain): Outbox 领域模型 + 仓储接口"`
 
 ---
 
-## Task 10: 分布式锁 LockUtil（TDD，Mock Redisson）
+## Task 13: 示例业务 domain（订单）
 
 **Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/lock/LockUtil.java`
-- Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/common/lock/LockUtilTest.java`
-
-- [ ] **Step 1: 写失败测试**
-
-```java
-package com.ddd.dubbo.domain.common.lock;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
-
-import java.util.concurrent.TimeUnit;
-
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.Mockito.*;
-
-class LockUtilTest {
-
-    @Test
-    void lockKeyFormatsWithPrefix() {
-        RedissonClient client = mock(RedissonClient.class);
-        LockUtil util = new LockUtil(client);
-        assertEquals("lock:order:100", util.lockKey("order", "100"));
-    }
-
-    @Test
-    void lockAcquiresAndRunsActionThenUnlocks() throws InterruptedException {
-        RedissonClient client = mock(RedissonClient.class);
-        RLock lock = mock(RLock.class);
-        when(client.getLock("lock:order:100")).thenReturn(lock);
-        when(lock.tryLock(5L, TimeUnit.SECONDS)).thenReturn(true);
-        when(lock.isHeldByCurrentThread()).thenReturn(true);
-
-        LockUtil util = new LockUtil(client);
-        String result = util.lock("lock:order:100", 5, () -> "done");
-
-        assertEquals("done", result);
-        verify(lock).unlock();
-    }
-
-    @Test
-    void lockThrowsWhenTimeout() throws InterruptedException {
-        RedissonClient client = mock(RedissonClient.class);
-        RLock lock = mock(RLock.class);
-        when(client.getLock("k")).thenReturn(lock);
-        when(lock.tryLock(5L, TimeUnit.SECONDS)).thenReturn(false);
-
-        LockUtil util = new LockUtil(client);
-        assertThrows(BizException.class, () -> util.lock("k", 5, () -> "never"));
-    }
-}
-```
-
-- [ ] **Step 2: 运行确认失败** → FAIL
-
-- [ ] **Step 3: 实现**
-
-```java
-package com.ddd.dubbo.domain.common.lock;
-
-import com.ddd.dubbo.domain.common.exception.BizException;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
-
-import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
-
-/** 分布式锁工具（Redisson） */
-public class LockUtil {
-
-    private static final int LOCK_TIMEOUT = 5003;
-
-    private final RedissonClient redissonClient;
-
-    public LockUtil(RedissonClient redissonClient) {
-        this.redissonClient = redissonClient;
-    }
-
-    /** 单锁：带看门狗自动续期，获取超时抛异常 */
-    public <T> T lock(String key, long waitSeconds, Supplier<T> action) {
-        RLock lock = redissonClient.getLock(key);
-        try {
-            if (!lock.tryLock(waitSeconds, TimeUnit.SECONDS)) {
-                throw new BizException(LOCK_TIMEOUT, "获取锁超时");
-            }
-            return action.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new BizException(LOCK_TIMEOUT, "获取锁被中断");
-        } finally {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
-        }
-    }
-
-    /** 多重锁：按固定顺序加锁，降低死锁风险 */
-    public RLock multiLock(String... keys) {
-        RLock[] locks = new RLock[keys.length];
-        for (int i = 0; i < keys.length; i++) {
-            locks[i] = redissonClient.getLock(keys[i]);
-        }
-        return redissonClient.getMultiLock(locks);
-    }
-
-    /** 锁 key 生成：统一前缀 + 业务维度 */
-    public String lockKey(String biz, String... dimensions) {
-        return "lock:" + biz + ":" + String.join(":", dimensions);
-    }
-}
-```
-
-- [ ] **Step 4: 运行确认通过** → PASS
-
-- [ ] **Step 5: 提交**
-
-```bash
-git add ddd-dubbo-domain
-git commit -m "feat(domain): Redisson 分布式锁工具 LockUtil"
-```
-
----
-
-## Task 11: 线程池配置（场景化 + TTL）
-
-**Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/threadpool/ThreadPoolConfig.java`
-
-- [ ] **Step 1: 实现（无单测，编译验证）**
-
-```java
-package com.ddd.dubbo.domain.common.threadpool;
-
-import com.alibaba.ttl.threadpool.TtlExecutors;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-
-import java.util.concurrent.ExecutorService;
-
-/** 场景化线程池（TTL 包装透传上下文） */
-@Configuration
-public class ThreadPoolConfig {
-
-    @Bean("commonTaskPool")
-    public ExecutorService commonTaskPool() {
-        return ttl(executor(10, 50, 1000, "common-"));
-    }
-
-    @Bean("exportTaskPool")
-    public ExecutorService exportTaskPool() {
-        return ttl(executor(4, 16, 500, "export-"));
-    }
-
-    private ThreadPoolTaskExecutor executor(int core, int max, int queue, String prefix) {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(core);
-        executor.setMaxPoolSize(max);
-        executor.setQueueCapacity(queue);
-        executor.setThreadNamePrefix(prefix);
-        executor.initialize();
-        return executor;
-    }
-
-    private ExecutorService ttl(ThreadPoolTaskExecutor executor) {
-        return TtlExecutors.getTtlExecutorService(executor.getThreadPoolExecutor());
-    }
-}
-```
-
-- [ ] **Step 2: 编译验证** → `mvn -q -pl ddd-dubbo-domain -am compile` → SUCCESS
-
-- [ ] **Step 3: 提交**
-
-```bash
-git add ddd-dubbo-domain
-git commit -m "feat(domain): 场景化线程池 + TTL 透传"
-```
-
----
-
-## Task 12: 示例业务 domain（订单聚合 + 用例 + 扩展点 + 状态枚举）
-
-**Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/entity/Order.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/repository/OrderRepository.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/service/OrderService.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/command/{CreateOrderCommand,QueryOrderCommand}.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/extension/{OrderDiscountExtPt,NormalOrderDiscountExt,VipOrderDiscountExt}.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/statemachine/{OrderStatus,OrderEvent,OrderContext}.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/exe/CreateOrderCmdExe.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/entity/Order.java`（时间字段 `Long createdAt/updatedAt`）
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/repository/OrderRepository.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/service/OrderService.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/command/CreateOrderCommand.java`、`QueryOrderCommand.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/exe/CreateOrderCmdExe.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/extension/OrderDiscountExtPt.java`、`NormalOrderDiscountExt.java`、`VipOrderDiscountExt.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/order/statemachine/OrderStatus.java`、`OrderEvent.java`、`OrderContext.java`
 - Test: `ddd-dubbo-domain/src/test/java/com/ddd/dubbo/domain/order/OrderServiceTest.java`
 
-- [ ] **Step 1: 写失败测试（订单领域规则）**
+- [ ] **Step 1: 失败测试（订单领域规则 + 时间戳）**
 
 ```java
 package com.ddd.dubbo.domain.order;
@@ -1727,26 +953,21 @@ import com.ddd.dubbo.domain.order.entity.Order;
 import com.ddd.dubbo.domain.order.repository.OrderRepository;
 import com.ddd.dubbo.domain.order.service.OrderService;
 import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
-
 import java.math.BigDecimal;
-
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class OrderServiceTest {
 
     @Test
-    void createOrderBuildsInitOrder() {
+    void createOrderBuildsInitOrderWithUtcTimestamp() {
         OrderRepository repo = mock(OrderRepository.class);
         OrderService service = new OrderService(repo);
-
         Order order = service.createOrder(100L, new BigDecimal("50"));
-
         assertEquals(Long.valueOf(100L), order.getUserId());
         assertEquals(new BigDecimal("50"), order.getAmount());
-        assertEquals(Order.OrderStatus.INIT, order.getStatus());
-        assertEquals(BigDecimal.ZERO, order.getDiscount());
+        assertEquals(OrderStatus.INIT, order.getStatus());
+        assertNotNull(order.getCreatedAt());
     }
 
     @Test
@@ -1754,7 +975,6 @@ class OrderServiceTest {
         Order order = new Order();
         order.setAmount(new BigDecimal("100"));
         order.applyDiscount(new BigDecimal("20"));
-
         assertEquals(new BigDecimal("20"), order.getDiscount());
     }
 
@@ -1762,17 +982,15 @@ class OrderServiceTest {
     void saveDelegatesToRepository() {
         OrderRepository repo = mock(OrderRepository.class);
         OrderService service = new OrderService(repo);
-        Order order = new Order();
-        service.save(order);
-
-        verify(repo).save(order);
+        service.save(new Order());
+        verify(repo).save(any(Order.class));
     }
 }
 ```
 
 - [ ] **Step 2: 运行确认失败** → FAIL
 
-- [ ] **Step 3: 实现实体 / 仓储接口 / 领域服务**
+- [ ] **Step 3: 实现 Order（Long 时间戳）**
 
 ```java
 package com.ddd.dubbo.domain.order.entity;
@@ -1782,23 +1000,22 @@ import java.math.BigDecimal;
 /** 订单聚合根 */
 public class Order {
 
-    public enum OrderStatus { INIT, PAID, SHIPPED, COMPLETED, CANCELLED }
-
     private Long id;
     private Long userId;
     private BigDecimal amount;
     private BigDecimal discount = BigDecimal.ZERO;
-    private OrderStatus status = OrderStatus.INIT;
+    private String status;
+    private Long createdAt;   // UTC 毫秒时间戳
+    private Long updatedAt;   // UTC 毫秒时间戳
 
     public void applyDiscount(BigDecimal d) {
-        if (d == null) {
-            return;
+        if (d != null) {
+            this.discount = this.discount.add(d);
         }
-        this.discount = this.discount.add(d);
     }
 
     public void pay() {
-        this.status = OrderStatus.PAID;
+        this.status = com.ddd.dubbo.domain.order.statemachine.OrderStatus.PAID.name();
     }
 
     public Long getId() { return id; }
@@ -1809,142 +1026,16 @@ public class Order {
     public void setAmount(BigDecimal amount) { this.amount = amount; }
     public BigDecimal getDiscount() { return discount; }
     public void setDiscount(BigDecimal discount) { this.discount = discount; }
-    public OrderStatus getStatus() { return status; }
-    public void setStatus(OrderStatus status) { this.status = status; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public Long getCreatedAt() { return createdAt; }
+    public void setCreatedAt(Long createdAt) { this.createdAt = createdAt; }
+    public Long getUpdatedAt() { return updatedAt; }
+    public void setUpdatedAt(Long updatedAt) { this.updatedAt = updatedAt; }
 }
 ```
 
-```java
-package com.ddd.dubbo.domain.order.repository;
-
-import com.ddd.dubbo.domain.order.entity.Order;
-
-/** 订单仓储接口（domain 定义，infra 实现，依赖倒置） */
-public interface OrderRepository {
-    Order findById(Long id);
-    void save(Order order);
-}
-```
-
-```java
-package com.ddd.dubbo.domain.order.service;
-
-import com.ddd.dubbo.domain.order.entity.Order;
-import com.ddd.dubbo.domain.order.repository.OrderRepository;
-
-import java.math.BigDecimal;
-
-/** 订单领域服务 */
-public class OrderService {
-
-    private final OrderRepository orderRepository;
-
-    public OrderService(OrderRepository orderRepository) {
-        this.orderRepository = orderRepository;
-    }
-
-    public Order createOrder(Long userId, BigDecimal amount) {
-        Order order = new Order();
-        order.setUserId(userId);
-        order.setAmount(amount);
-        return order;
-    }
-
-    public void save(Order order) {
-        orderRepository.save(order);
-    }
-}
-```
-
-- [ ] **Step 4: 实现 Command / 扩展点 / 状态枚举**
-
-```java
-package com.ddd.dubbo.domain.order.command;
-
-import com.ddd.dubbo.api.order.model.resp.OrderResp;
-import com.ddd.dubbo.domain.exe.Command;
-
-import java.math.BigDecimal;
-
-public class CreateOrderCommand implements Command<OrderResp> {
-    private Long userId;
-    private String channel;
-    private BigDecimal amount;
-
-    public Long getUserId() { return userId; }
-    public void setUserId(Long userId) { this.userId = userId; }
-    public String getChannel() { return channel; }
-    public void setChannel(String channel) { this.channel = channel; }
-    public BigDecimal getAmount() { return amount; }
-    public void setAmount(BigDecimal amount) { this.amount = amount; }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.order.command;
-
-import com.ddd.dubbo.api.order.model.resp.OrderResp;
-import com.ddd.dubbo.domain.exe.Query;
-
-public class QueryOrderCommand implements Query<OrderResp> {
-    private Long orderId;
-
-    public Long getOrderId() { return orderId; }
-    public void setOrderId(Long orderId) { this.orderId = orderId; }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.order.extension;
-
-import com.ddd.dubbo.domain.extension.ExtensionPoint;
-import com.ddd.dubbo.domain.order.entity.Order;
-
-import java.math.BigDecimal;
-
-/** 订单折扣扩展点 */
-public interface OrderDiscountExtPt extends ExtensionPoint {
-    BigDecimal calculateDiscount(Order order);
-}
-```
-
-```java
-package com.ddd.dubbo.domain.order.extension;
-
-import com.ddd.dubbo.domain.extension.Extension;
-import com.ddd.dubbo.domain.order.entity.Order;
-import org.springframework.stereotype.Component;
-
-import java.math.BigDecimal;
-
-@Extension(bizId = "normal", useCase = "order", scenario = "default")
-@Component
-public class NormalOrderDiscountExt implements OrderDiscountExtPt {
-    @Override
-    public BigDecimal calculateDiscount(Order order) {
-        return BigDecimal.ZERO;
-    }
-}
-```
-
-```java
-package com.ddd.dubbo.domain.order.extension;
-
-import com.ddd.dubbo.domain.extension.Extension;
-import com.ddd.dubbo.domain.order.entity.Order;
-import org.springframework.stereotype.Component;
-
-import java.math.BigDecimal;
-
-@Extension(bizId = "vip", useCase = "order", scenario = "default")
-@Component
-public class VipOrderDiscountExt implements OrderDiscountExtPt {
-    @Override
-    public BigDecimal calculateDiscount(Order order) {
-        return order.getAmount().multiply(new BigDecimal("0.2"));
-    }
-}
-```
+> 注：`Order.status` 用 `String`（存枚举名），状态枚举统一用 `com.ddd.dubbo.domain.order.statemachine.OrderStatus`，避免重复枚举。
 
 ```java
 package com.ddd.dubbo.domain.order.statemachine;
@@ -1963,7 +1054,6 @@ package com.ddd.dubbo.domain.order.statemachine;
 
 import java.math.BigDecimal;
 
-/** 订单状态机上下文 */
 public class OrderContext {
     private BigDecimal balance;
     private BigDecimal amount;
@@ -1975,9 +1065,135 @@ public class OrderContext {
 }
 ```
 
-- [ ] **Step 5: 实现用例执行器（依赖 infra 的 Converter，本任务先留空实现）**
+- [ ] **Step 4: 实现 OrderService / OrderRepository / Command / 扩展点 / CmdExe**
 
-> `CreateOrderCmdExe` 依赖 `OrderConverter`（infra 层）做 Entity→Resp 转换。为保持依赖方向（domain 不依赖 infra），`OrderResp` 的组装放在 app 层 Provider 内完成，`CreateOrderCmdExe` 返回领域对象 `Order`。因此 Command 的返回类型改为 `Order`（而非 `OrderResp`）。
+```java
+package com.ddd.dubbo.domain.order.repository;
+
+import com.ddd.dubbo.domain.order.entity.Order;
+
+public interface OrderRepository {
+    Order findById(Long id);
+    void save(Order order);
+}
+```
+
+```java
+package com.ddd.dubbo.domain.order.service;
+
+import com.ddd.dubbo.domain.common.time.TimeZoneUtils;
+import com.ddd.dubbo.domain.order.entity.Order;
+import com.ddd.dubbo.domain.order.repository.OrderRepository;
+import com.ddd.dubbo.domain.order.statemachine.OrderStatus;
+
+import java.math.BigDecimal;
+
+public class OrderService {
+
+    private final OrderRepository orderRepository;
+
+    public OrderService(OrderRepository orderRepository) {
+        this.orderRepository = orderRepository;
+    }
+
+    public Order createOrder(Long userId, BigDecimal amount) {
+        Order order = new Order();
+        order.setUserId(userId);
+        order.setAmount(amount);
+        order.setStatus(OrderStatus.INIT.name());
+        order.setCreatedAt(TimeZoneUtils.getCurrentUtcTimestamp());
+        order.setUpdatedAt(order.getCreatedAt());
+        return order;
+    }
+
+    public void save(Order order) {
+        orderRepository.save(order);
+    }
+}
+```
+
+```java
+package com.ddd.dubbo.domain.order.command;
+
+import com.ddd.dubbo.domain.exe.Command;
+import com.ddd.dubbo.domain.order.entity.Order;
+import java.math.BigDecimal;
+
+public class CreateOrderCommand implements Command<Order> {
+    private Long userId;
+    private String channel;
+    private BigDecimal amount;
+
+    public Long getUserId() { return userId; }
+    public void setUserId(Long userId) { this.userId = userId; }
+    public String getChannel() { return channel; }
+    public void setChannel(String channel) { this.channel = channel; }
+    public BigDecimal getAmount() { return amount; }
+    public void setAmount(BigDecimal amount) { this.amount = amount; }
+}
+```
+
+```java
+package com.ddd.dubbo.domain.order.command;
+
+import com.ddd.dubbo.domain.exe.Query;
+import com.ddd.dubbo.domain.order.entity.Order;
+
+public class QueryOrderCommand implements Query<Order> {
+    private Long orderId;
+
+    public Long getOrderId() { return orderId; }
+    public void setOrderId(Long orderId) { this.orderId = orderId; }
+}
+```
+
+```java
+package com.ddd.dubbo.domain.order.extension;
+
+import com.ddd.dubbo.domain.extension.ExtensionPoint;
+import com.ddd.dubbo.domain.order.entity.Order;
+import java.math.BigDecimal;
+
+public interface OrderDiscountExtPt extends ExtensionPoint {
+    BigDecimal calculateDiscount(Order order);
+}
+```
+
+```java
+package com.ddd.dubbo.domain.order.extension;
+
+import com.ddd.dubbo.domain.extension.Extension;
+import com.ddd.dubbo.domain.order.entity.Order;
+import org.springframework.stereotype.Component;
+import java.math.BigDecimal;
+
+@Extension(bizId = "normal", useCase = "order", scenario = "default")
+@Component
+public class NormalOrderDiscountExt implements OrderDiscountExtPt {
+    @Override
+    public BigDecimal calculateDiscount(Order order) {
+        return BigDecimal.ZERO;
+    }
+}
+```
+
+```java
+package com.ddd.dubbo.domain.order.extension;
+
+import com.ddd.dubbo.domain.extension.Extension;
+import com.ddd.dubbo.domain.order.entity.Order;
+import org.springframework.stereotype.Component;
+import java.math.BigDecimal;
+
+@Extension(bizId = "vip", useCase = "order", scenario = "default")
+@Component
+public class VipOrderDiscountExt implements OrderDiscountExtPt {
+    @Override
+    public BigDecimal calculateDiscount(Order order) {
+        return order.getAmount().multiply(new BigDecimal("0.2"));
+    }
+}
+```
 
 ```java
 package com.ddd.dubbo.domain.order.exe;
@@ -1991,7 +1207,6 @@ import com.ddd.dubbo.domain.order.extension.OrderDiscountExtPt;
 import com.ddd.dubbo.domain.order.service.OrderService;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
-
 import javax.annotation.Resource;
 import java.math.BigDecimal;
 
@@ -2017,48 +1232,41 @@ public class CreateOrderCmdExe implements CmdExe<CreateOrderCommand, Order> {
 }
 ```
 
-> 由于 `CreateOrderCmdExe` 返回 `Order`，需同步修正 `CreateOrderCommand` 的泛型为 `Command<Order>`，`QueryOrderCommand` 泛型为 `Query<Order>`。请执行以下修正：将 `CreateOrderCommand` 声明改为 `implements Command<Order>` 并 import `Order`；`QueryOrderCommand` 改为 `implements Query<Order>`。
+- [ ] **Step 5: 运行确认通过** → PASS
 
-- [ ] **Step 6: 运行测试确认通过**
-
-Run: `mvn -q -pl ddd-dubbo-domain -am test`
-Expected: PASS（OrderServiceTest 3 用例）
-
-- [ ] **Step 7: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
 git add ddd-dubbo-domain
-git commit -m "feat(domain): 订单示例业务（聚合/服务/仓储接口/扩展点/状态机枚举/用例执行器）"
+git commit -m "feat(domain): 订单示例业务（聚合/服务/扩展点/用例执行器，Long 时间戳）"
 ```
 
 ---
 
-## Task 13: infra 层（DO/Mapper/XML/Converter/RepositoryImpl）
+## Task 14: infra 订单数据访问（Long 时间戳）
 
 **Files:**
-- Create: `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/dataobject/OrderDO.java`
-- Create: `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/mapper/OrderMapper.java`
-- Create: `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/converter/OrderConverter.java`
-- Create: `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/repository/OrderRepositoryImpl.java`
-- Create: `ddd-dubbo-infra/src/main/resources/mapper/OrderMapper.xml`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/dataobject/OrderDO.java`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/mapper/OrderMapper.java`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/converter/OrderConverter.java`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/order/repository/OrderRepositoryImpl.java`
+- `ddd-dubbo-infra/src/main/resources/mapper/OrderMapper.xml`
 
-- [ ] **Step 1: 实现 DO / Mapper / XML**
+- [ ] **Step 1: 实现（Long 时间戳，SQL 显式写 XML）**
 
 ```java
 package com.ddd.dubbo.infra.order.dataobject;
 
 import java.math.BigDecimal;
-import java.util.Date;
 
-/** 订单表映射对象 */
 public class OrderDO {
     private Long id;
     private Long userId;
     private BigDecimal amount;
     private BigDecimal discount;
     private String status;
-    private Date createTime;
-    private Date updateTime;
+    private Long createTime;   // UTC 毫秒时间戳
+    private Long updateTime;   // UTC 毫秒时间戳
 
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
@@ -2070,10 +1278,10 @@ public class OrderDO {
     public void setDiscount(BigDecimal discount) { this.discount = discount; }
     public String getStatus() { return status; }
     public void setStatus(String status) { this.status = status; }
-    public Date getCreateTime() { return createTime; }
-    public void setCreateTime(Date createTime) { this.createTime = createTime; }
-    public Date getUpdateTime() { return updateTime; }
-    public void setUpdateTime(Date updateTime) { this.updateTime = updateTime; }
+    public Long getCreateTime() { return createTime; }
+    public void setCreateTime(Long createTime) { this.createTime = createTime; }
+    public Long getUpdateTime() { return updateTime; }
+    public void setUpdateTime(Long updateTime) { this.updateTime = updateTime; }
 }
 ```
 
@@ -2084,7 +1292,6 @@ import com.ddd.dubbo.infra.order.dataobject.OrderDO;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
-/** 订单 Mapper（原生 MyBatis，SQL 显式写在 XML） */
 @Mapper
 public interface OrderMapper {
     OrderDO findById(@Param("id") Long id);
@@ -2107,22 +1314,20 @@ public interface OrderMapper {
     <insert id="insert" parameterType="com.ddd.dubbo.infra.order.dataobject.OrderDO"
             useGeneratedKeys="true" keyProperty="id">
         INSERT INTO t_order (user_id, amount, discount, status, create_time, update_time)
-        VALUES (#{userId}, #{amount}, #{discount}, #{status}, now(), now())
+        VALUES (#{userId}, #{amount}, #{discount}, #{status}, #{createTime}, #{updateTime})
     </insert>
 
 </mapper>
 ```
-
-- [ ] **Step 2: 实现 Converter / RepositoryImpl**
 
 ```java
 package com.ddd.dubbo.infra.order.converter;
 
 import com.ddd.dubbo.api.order.model.resp.OrderResp;
 import com.ddd.dubbo.domain.order.entity.Order;
+import com.ddd.dubbo.domain.order.statemachine.OrderStatus;
 import com.ddd.dubbo.infra.order.dataobject.OrderDO;
 
-/** 订单对象转换（Entity ↔ DO ↔ Resp） */
 public final class OrderConverter {
 
     private OrderConverter() {
@@ -2137,7 +1342,9 @@ public final class OrderConverter {
         order.setUserId(orderDO.getUserId());
         order.setAmount(orderDO.getAmount());
         order.setDiscount(orderDO.getDiscount());
-        order.setStatus(Order.OrderStatus.valueOf(orderDO.getStatus()));
+        order.setStatus(orderDO.getStatus());
+        order.setCreatedAt(orderDO.getCreateTime());
+        order.setUpdatedAt(orderDO.getUpdateTime());
         return order;
     }
 
@@ -2147,7 +1354,9 @@ public final class OrderConverter {
         orderDO.setUserId(order.getUserId());
         orderDO.setAmount(order.getAmount());
         orderDO.setDiscount(order.getDiscount());
-        orderDO.setStatus(order.getStatus().name());
+        orderDO.setStatus(order.getStatus());
+        orderDO.setCreateTime(order.getCreatedAt());
+        orderDO.setUpdateTime(order.getUpdatedAt());
         return orderDO;
     }
 
@@ -2157,7 +1366,8 @@ public final class OrderConverter {
         resp.setUserId(order.getUserId());
         resp.setAmount(order.getAmount());
         resp.setDiscount(order.getDiscount());
-        resp.setStatus(order.getStatus().name());
+        resp.setStatus(order.getStatus());
+        resp.setCreatedAt(order.getCreatedAt());
         return resp;
     }
 }
@@ -2172,10 +1382,8 @@ import com.ddd.dubbo.infra.order.converter.OrderConverter;
 import com.ddd.dubbo.infra.order.dataobject.OrderDO;
 import com.ddd.dubbo.infra.order.mapper.OrderMapper;
 import org.springframework.stereotype.Repository;
-
 import javax.annotation.Resource;
 
-/** 订单仓储实现（依赖倒置：实现 domain 的 OrderRepository 接口） */
 @Repository
 public class OrderRepositoryImpl implements OrderRepository {
 
@@ -2195,267 +1403,193 @@ public class OrderRepositoryImpl implements OrderRepository {
 }
 ```
 
-- [ ] **Step 3: 编译验证** → `mvn -q -pl ddd-dubbo-infra -am compile` → SUCCESS
+- [ ] **Step 2: 编译验证** → SUCCESS
 
-- [ ] **Step 4: 提交**
-
-```bash
-git add ddd-dubbo-infra
-git commit -m "feat(infra): 订单 DO/Mapper/XML/Converter/RepositoryImpl"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(infra): 订单 DO/Mapper/XML/Converter/RepositoryImpl（Long 时间戳）"`
 
 ---
 
-## Task 14: app 配置（数据源/Redisson/Caffeine/Dubbo）+ Dubbo 上下文 Filter
+## Task 15: infra Outbox 数据访问
 
 **Files:**
-- Create: `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/config/{DataSourceConfig,RedissonProperties,RedissonConfig,LocalCacheConfig,DubboConfig}.java`
-- Create: `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/config/filter/{DubboProviderFilter,DubboConsumerFilter}.java`
-- Create: `ddd-dubbo-app/src/main/resources/application.yml`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/outbox/dataobject/OutboxDO.java`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/outbox/mapper/OutboxMapper.java`
+- `ddd-dubbo-infra/src/main/java/com/ddd/dubbo/infra/outbox/repository/OutboxRepositoryImpl.java`
+- `ddd-dubbo-infra/src/main/resources/mapper/OutboxMapper.xml`
 
-- [ ] **Step 1: 数据源配置（原生 MyBatis + Druid + PageHelper）**
-
-```java
-package com.ddd.dubbo.app.config;
-
-import org.apache.ibatis.session.SqlSessionFactory;
-import org.mybatis.spring.SqlSessionFactoryBean;
-import org.mybatis.spring.SqlSessionTemplate;
-import org.mybatis.spring.annotation.MapperScan;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
-import org.springframework.jdbc.datasource.DataSourceTransactionManager;
-
-import javax.sql.DataSource;
-
-@Configuration
-@MapperScan(basePackages = "com.ddd.dubbo.infra.**.mapper")
-public class DataSourceConfig {
-
-    @Bean
-    @Primary
-    public SqlSessionFactory sqlSessionFactory(DataSource dataSource) throws Exception {
-        SqlSessionFactoryBean factoryBean = new SqlSessionFactoryBean();
-        factoryBean.setDataSource(dataSource);
-        factoryBean.setMapperLocations(
-                new PathMatchingResourcePatternResolver()
-                        .getResources("classpath*:mapper/**/*.xml"));
-        org.apache.ibatis.session.Configuration config =
-                new org.apache.ibatis.session.Configuration();
-        config.setMapUnderscoreToCamelCase(true);
-        factoryBean.setConfiguration(config);
-        return factoryBean.getObject();
-    }
-
-    @Bean
-    @Primary
-    public DataSourceTransactionManager transactionManager(DataSource dataSource) {
-        return new DataSourceTransactionManager(dataSource);
-    }
-
-    @Bean
-    @Primary
-    public SqlSessionTemplate sqlSessionTemplate(SqlSessionFactory sqlSessionFactory) {
-        return new SqlSessionTemplate(sqlSessionFactory);
-    }
-}
-```
-
-- [ ] **Step 2: Redisson 配置 + 属性**
+- [ ] **Step 1: 实现**
 
 ```java
-package com.ddd.dubbo.app.config;
+package com.ddd.dubbo.infra.outbox.dataobject;
 
-import org.springframework.boot.context.properties.ConfigurationProperties;
+public class OutboxDO {
+    private Long id;
+    private String eventType;
+    private String payload;
+    private Integer status;
+    private Integer retryCount;
+    private Long createTime;
 
-@ConfigurationProperties(prefix = "ddd.dubbo.redisson")
-public class RedissonProperties {
-    private String host = "127.0.0.1";
-    private int port = 6379;
-
-    public String getHost() { return host; }
-    public void setHost(String host) { this.host = host; }
-    public int getPort() { return port; }
-    public void setPort(int port) { this.port = port; }
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public String getEventType() { return eventType; }
+    public void setEventType(String eventType) { this.eventType = eventType; }
+    public String getPayload() { return payload; }
+    public void setPayload(String payload) { this.payload = payload; }
+    public Integer getStatus() { return status; }
+    public void setStatus(Integer status) { this.status = status; }
+    public Integer getRetryCount() { return retryCount; }
+    public void setRetryCount(Integer retryCount) { this.retryCount = retryCount; }
+    public Long getCreateTime() { return createTime; }
+    public void setCreateTime(Long createTime) { this.createTime = createTime; }
 }
 ```
 
 ```java
-package com.ddd.dubbo.app.config;
+package com.ddd.dubbo.infra.outbox.mapper;
 
-import org.redisson.Redisson;
-import org.redisson.api.RedissonClient;
-import org.redisson.config.Config;
-import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+import com.ddd.dubbo.infra.outbox.dataobject.OutboxDO;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
 
-@Configuration
-@EnableConfigurationProperties(RedissonProperties.class)
-public class RedissonConfig {
+import java.util.List;
 
-    @Bean(destroyMethod = "shutdown")
-    public RedissonClient redissonClient(RedissonProperties props) {
-        Config config = new Config();
-        config.useSingleServer().setAddress("redis://" + props.getHost() + ":" + props.getPort());
-        return Redisson.create(config);
-    }
+@Mapper
+public interface OutboxMapper {
+    int insert(OutboxDO outboxDO);
+    List<OutboxDO> selectPending(@Param("limit") int limit);
+    int markSent(@Param("id") Long id);
+    int increaseRetry(@Param("id") Long id);
 }
 ```
 
-- [ ] **Step 3: Caffeine 本地缓存 + Dubbo 配置**
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.ddd.dubbo.infra.outbox.mapper.OutboxMapper">
 
-```java
-package com.ddd.dubbo.app.config;
+    <insert id="insert" parameterType="com.ddd.dubbo.infra.outbox.dataobject.OutboxDO"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO outbox (event_type, payload, status, retry_count, create_time)
+        VALUES (#{eventType}, #{payload}, #{status}, #{retryCount}, #{createTime})
+    </insert>
 
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+    <select id="selectPending" resultType="com.ddd.dubbo.infra.outbox.dataobject.OutboxDO">
+        SELECT id, event_type, payload, status, retry_count, create_time
+        FROM outbox
+        WHERE status = 0
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
 
-import java.util.concurrent.TimeUnit;
+    <update id="markSent">
+        UPDATE outbox SET status = 1 WHERE id = #{id}
+    </update>
 
-@Configuration
-public class LocalCacheConfig {
+    <update id="increaseRetry">
+        UPDATE outbox SET retry_count = retry_count + 1 WHERE id = #{id}
+    </update>
 
-    @Bean
-    public Cache<String, Object> localCache() {
-        return Caffeine.newBuilder()
-                .maximumSize(1_000_000)
-                .expireAfterWrite(24, TimeUnit.HOURS)
-                .build();
-    }
-}
+</mapper>
 ```
 
 ```java
-package com.ddd.dubbo.app.config;
+package com.ddd.dubbo.infra.outbox.repository;
 
-import org.apache.dubbo.config.ApplicationConfig;
-import org.apache.dubbo.config.ProtocolConfig;
-import org.apache.dubbo.config.RegistryConfig;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+import com.ddd.dubbo.domain.outbox.OutboxEvent;
+import com.ddd.dubbo.domain.outbox.OutboxRepository;
+import com.ddd.dubbo.domain.common.time.TimeZoneUtils;
+import com.ddd.dubbo.infra.outbox.dataobject.OutboxDO;
+import com.ddd.dubbo.infra.outbox.mapper.OutboxMapper;
+import org.springframework.stereotype.Repository;
 
-@Configuration
-public class DubboConfig {
+import javax.annotation.Resource;
+import java.util.ArrayList;
+import java.util.List;
 
-    @Bean
-    public ApplicationConfig applicationConfig() {
-        ApplicationConfig config = new ApplicationConfig();
-        config.setName("ddd-dubbo");
-        return config;
-    }
+@Repository
+public class OutboxRepositoryImpl implements OutboxRepository {
 
-    @Bean
-    public RegistryConfig registryConfig() {
-        RegistryConfig config = new RegistryConfig();
-        config.setAddress("nacos://${nacos.addrs:127.0.0.1:8848}");
-        return config;
-    }
-
-    @Bean
-    public ProtocolConfig protocolConfig() {
-        ProtocolConfig config = new ProtocolConfig();
-        config.setName("dubbo");
-        config.setPort(-1);
-        return config;
-    }
-}
-```
-
-- [ ] **Step 4: Dubbo 上下文透传 Filter**
-
-```java
-package com.ddd.dubbo.app.config.filter;
-
-import com.ddd.dubbo.domain.common.context.UserContext;
-import org.apache.dubbo.common.constants.CommonConstants;
-import org.apache.dubbo.common.extension.Activate;
-import org.apache.dubbo.rpc.*;
-
-/** Provider 侧：从 attachment 恢复用户上下文 */
-@Activate(group = CommonConstants.PROVIDER)
-public class DubboProviderFilter implements Filter {
+    @Resource
+    private OutboxMapper outboxMapper;
 
     @Override
-    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
-        try {
-            UserContext ctx = new UserContext();
-            String userId = invocation.getAttachment("userId");
-            if (userId != null) {
-                ctx.setUserId(Long.valueOf(userId));
-            }
-            ctx.setLocale(invocation.getAttachment("locale"));
-            ctx.setTimeZone(invocation.getAttachment("timeZone"));
-            ctx.setTenantId(invocation.getAttachment("tenantId"));
-            UserContext.set(ctx);
-            return invoker.invoke(invocation);
-        } finally {
-            UserContext.clear();
-        }
+    public void save(OutboxEvent event) {
+        OutboxDO outboxDO = new OutboxDO();
+        outboxDO.setEventType(event.getEventType());
+        outboxDO.setPayload(event.getPayload());
+        outboxDO.setStatus(event.getStatus() == null ? OutboxEvent.STATUS_PENDING : event.getStatus());
+        outboxDO.setRetryCount(event.getRetryCount() == null ? 0 : event.getRetryCount());
+        outboxDO.setCreateTime(TimeZoneUtils.getCurrentUtcTimestamp());
+        outboxMapper.insert(outboxDO);
     }
-}
-```
-
-```java
-package com.ddd.dubbo.app.config.filter;
-
-import com.ddd.dubbo.domain.common.context.UserContext;
-import org.apache.dubbo.common.constants.CommonConstants;
-import org.apache.dubbo.common.extension.Activate;
-import org.apache.dubbo.rpc.*;
-
-/** Consumer 侧：把上下文写回 attachment 继续透传 */
-@Activate(group = CommonConstants.CONSUMER)
-public class DubboConsumerFilter implements Filter {
 
     @Override
-    public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
-        UserContext ctx = UserContext.get();
-        if (ctx != null) {
-            if (ctx.getUserId() != null) {
-                invocation.setAttachment("userId", String.valueOf(ctx.getUserId()));
-            }
-            invocation.setAttachment("locale", ctx.getLocale());
-            invocation.setAttachment("timeZone", ctx.getTimeZone());
-            invocation.setAttachment("tenantId", ctx.getTenantId());
+    public List<OutboxEvent> selectPending(int limit) {
+        List<OutboxDO> list = outboxMapper.selectPending(limit);
+        List<OutboxEvent> result = new ArrayList<OutboxEvent>();
+        for (OutboxDO outboxDO : list) {
+            OutboxEvent e = new OutboxEvent();
+            e.setId(outboxDO.getId());
+            e.setEventType(outboxDO.getEventType());
+            e.setPayload(outboxDO.getPayload());
+            e.setStatus(outboxDO.getStatus());
+            e.setRetryCount(outboxDO.getRetryCount());
+            result.add(e);
         }
-        return invoker.invoke(invocation);
+        return result;
+    }
+
+    @Override
+    public void markSent(Long id) {
+        outboxMapper.markSent(id);
+    }
+
+    @Override
+    public void increaseRetry(Long id) {
+        outboxMapper.increaseRetry(id);
     }
 }
 ```
 
-- [ ] **Step 5: 编译验证** → `mvn -q -pl ddd-dubbo-app -am compile` → SUCCESS
+- [ ] **Step 2: 编译验证** → SUCCESS
 
-- [ ] **Step 6: 提交**
-
-```bash
-git add ddd-dubbo-app
-git commit -m "feat(app): 数据源/Redisson/Caffeine/Dubbo 配置 + 上下文透传 Filter"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(infra): Outbox 数据访问（Mapper/RepositoryImpl）"`
 
 ---
 
-## Task 15: app 统一异常切面 + 参数 Trim
+## Task 16: app 配置 + Dubbo 上下文 Filter
 
 **Files:**
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/ExceptionAnnotation.java`
-- Create: `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/ExceptionAspect.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/config/DataSourceConfig.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/config/DubboConfig.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/config/RedissonProperties.java`、`RedissonConfig.java`、`LocalCacheConfig.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/config/filter/DubboProviderFilter.java`、`DubboConsumerFilter.java`
 
-> 切面虽在 domain 模块（依赖 spring-aop/aspectj），但需在 app 启动时被扫描。app 启动类扫描 `com.ddd.dubbo` 全包即可。
+（代码与上一版计划 Task 14 一致。`DataSourceConfig` 用原生 MyBatis SqlSessionFactory + PageHelper；`RedissonConfig`/`LocalCacheConfig`/`DubboConfig` 同上一版。`DubboProviderFilter` 用 `UserContext.builder()` 构造不可变上下文，`finally` clear。）
 
-- [ ] **Step 1: 实现注解 + 切面**
+- [ ] **Step 1-2: 实现 + 编译** → SUCCESS
+
+- [ ] **Step 3: 提交** → `git commit -m "feat(app): 数据源/Redisson/Caffeine/Dubbo 配置 + 上下文透传 Filter"`
+
+---
+
+## Task 17: app 统一异常切面（pointcut 双条件）
+
+**Files:**
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/ExceptionAnnotation.java`
+- `ddd-dubbo-domain/src/main/java/com/ddd/dubbo/domain/common/exception/ExceptionAspect.java`
+
+- [ ] **Step 1: 实现（pointcut = @within(ExceptionAnnotation) && @within(DubboService)）**
 
 ```java
 package com.ddd.dubbo.domain.common.exception;
 
 import java.lang.annotation.*;
 
-/** 标记统一异常切面拦截的类/方法 */
-@Target({ElementType.TYPE, ElementType.METHOD})
+/** 开启统一异常切面的标记注解 */
+@Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface ExceptionAnnotation {
@@ -2465,7 +1599,7 @@ public @interface ExceptionAnnotation {
 ```java
 package com.ddd.dubbo.domain.common.exception;
 
-import com.ddd.dubbo.api.common.Result;
+import com.ddd.dubbo.api.result.Result;
 import com.ddd.dubbo.domain.common.context.TraceContext;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
@@ -2474,52 +1608,69 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-/** 统一异常切面：业务异常转 Result.fail，未知异常兜底 */
+/** 统一异常切面：只拦「@DubboService + @ExceptionAnnotation」的类 */
 @Aspect
 @Component
 public class ExceptionAspect {
 
     private static final Logger log = LoggerFactory.getLogger(ExceptionAspect.class);
-    private static final int SYS_ERROR = 5000;
+    private static final int SYS_ERROR_CODE = 5000;
 
-    @Around("@annotation(com.ddd.dubbo.domain.common.exception.ExceptionAnnotation)")
+    @Around("@within(com.ddd.dubbo.domain.common.exception.ExceptionAnnotation) " +
+            "&& @within(org.apache.dubbo.config.annotation.DubboService)")
     public Object handle(ProceedingJoinPoint pjp) {
         try {
             return pjp.proceed();
         } catch (BizException e) {
+            log.info("[biz] method={} code={} msg={}", pjp.getSignature(), e.getCode(), e.getMessage());
             return Result.fail(e.getCode(), e.getMessage()).withTraceId(TraceContext.getTraceId());
         } catch (Throwable t) {
-            log.error("[{}] 系统异常", pjp.getSignature(), t);
-            return Result.fail(SYS_ERROR, "系统异常，请稍后重试").withTraceId(TraceContext.getTraceId());
+            log.error("[sys] method={}", pjp.getSignature(), t);
+            return Result.fail(SYS_ERROR_CODE, "系统异常，请稍后重试").withTraceId(TraceContext.getTraceId());
         }
     }
 }
 ```
 
-- [ ] **Step 2: 编译验证** → `mvn -q -pl ddd-dubbo-domain -am compile` → SUCCESS
+- [ ] **Step 2: 编译验证** → SUCCESS
 
-- [ ] **Step 3: 提交**
-
-```bash
-git add ddd-dubbo-domain
-git commit -m "feat(domain): 统一异常切面 ExceptionAspect + ExceptionAnnotation"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(domain): 统一异常切面（@within(DubboService) 双条件）"`
 
 ---
 
-## Task 16: app Provider 实现 + 启动类
+## Task 18: app Provider + 启动类 + OutboxRelay + MQ
 
 **Files:**
-- Create: `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/provider/order/OrderProviderImpl.java`
-- Create: `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/StartApplication.java`
-- Create: `ddd-dubbo-app/src/main/resources/application.yml`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/StartApplication.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/provider/order/OrderProviderImpl.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/mq/MqProducerTemplate.java`、`IdempotentHelper.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/outbox/OutboxRelay.java`
+- `ddd-dubbo-app/src/main/resources/application.yml`
 
-- [ ] **Step 1: Provider 实现**
+- [ ] **Step 1: 实现**
+
+```java
+package com.ddd.dubbo.app;
+
+import org.apache.dubbo.config.spring.context.annotation.DubboComponentScan;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication(scanBasePackages = "com.ddd.dubbo")
+@DubboComponentScan(basePackages = "com.ddd.dubbo.app")
+@EnableScheduling
+public class StartApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(StartApplication.class, args);
+    }
+}
+```
 
 ```java
 package com.ddd.dubbo.app.provider.order;
 
-import com.ddd.dubbo.api.common.Result;
+import com.ddd.dubbo.api.result.Result;
 import com.ddd.dubbo.api.order.model.req.CreateOrderReq;
 import com.ddd.dubbo.api.order.model.req.QueryOrderReq;
 import com.ddd.dubbo.api.order.model.resp.OrderResp;
@@ -2532,7 +1683,6 @@ import com.ddd.dubbo.domain.order.command.QueryOrderCommand;
 import com.ddd.dubbo.domain.order.entity.Order;
 import com.ddd.dubbo.infra.order.converter.OrderConverter;
 import org.apache.dubbo.config.annotation.DubboService;
-
 import javax.annotation.Resource;
 
 @DubboService
@@ -2564,26 +1714,92 @@ public class OrderProviderImpl implements OrderProvider {
 }
 ```
 
-- [ ] **Step 2: 启动类**
-
 ```java
-package com.ddd.dubbo.app;
+package com.ddd.dubbo.app.mq;
 
-import org.apache.dubbo.config.spring.context.annotation.DubboComponentScan;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.springframework.stereotype.Component;
+import javax.annotation.Resource;
 
-/** 在线服务启动入口（排除 job 包扫描） */
-@SpringBootApplication(scanBasePackages = "com.ddd.dubbo")
-@DubboComponentScan(basePackages = "com.ddd.dubbo.app")
-public class StartApplication {
-    public static void main(String[] args) {
-        SpringApplication.run(StartApplication.class, args);
+@Component
+public class MqProducerTemplate {
+
+    @Resource
+    private RocketMQTemplate rocketMQTemplate;
+
+    public void send(String topic, Object payload) {
+        rocketMQTemplate.convertAndSend(topic, payload);
     }
 }
 ```
 
-- [ ] **Step 3: application.yml**
+```java
+package com.ddd.dubbo.app.mq;
+
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Component;
+import javax.annotation.Resource;
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class IdempotentHelper {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    public boolean tryConsume(String messageId) {
+        Boolean ok = stringRedisTemplate.opsForValue()
+                .setIfAbsent("idempotent:" + messageId, "1", 24, TimeUnit.HOURS);
+        return Boolean.TRUE.equals(ok);
+    }
+
+    public void complete(String messageId) {
+        stringRedisTemplate.opsForValue().set("idempotent:" + messageId + ":done", "1", 24, TimeUnit.HOURS);
+    }
+}
+```
+
+```java
+package com.ddd.dubbo.app.outbox;
+
+import com.ddd.dubbo.app.mq.MqProducerTemplate;
+import com.ddd.dubbo.domain.outbox.OutboxEvent;
+import com.ddd.dubbo.domain.outbox.OutboxRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.Resource;
+import java.util.List;
+
+/** Outbox 投递器：定时扫描 PENDING 消息投递 MQ，成功标记 SENT */
+@Component
+public class OutboxRelay {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
+    private static final int BATCH_SIZE = 100;
+
+    @Resource
+    private OutboxRepository outboxRepository;
+    @Resource
+    private MqProducerTemplate mqProducerTemplate;
+
+    @Scheduled(fixedDelay = 5000)
+    public void relay() {
+        List<OutboxEvent> pending = outboxRepository.selectPending(BATCH_SIZE);
+        for (OutboxEvent e : pending) {
+            try {
+                mqProducerTemplate.send(e.getEventType(), e.getPayload());
+                outboxRepository.markSent(e.getId());
+            } catch (Exception ex) {
+                log.error("[outbox] 投递失败 id={} type={}", e.getId(), e.getEventType(), ex);
+                outboxRepository.increaseRetry(e.getId());
+            }
+        }
+    }
+}
+```
 
 ```yaml
 spring:
@@ -2591,7 +1807,7 @@ spring:
     name: ddd-dubbo
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://127.0.0.1:3306/ddd_dubbo?useUnicode=true&characterEncoding=utf8
+    url: jdbc:mysql://127.0.0.1:3306/ddd_dubbo?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
     username: root
     password: root
     type: com.alibaba.druid.pool.DruidDataSource
@@ -2612,25 +1828,20 @@ ddd:
       port: 6379
 ```
 
-- [ ] **Step 4: 编译验证** → `mvn -q -pl ddd-dubbo-app -am compile` → SUCCESS
+- [ ] **Step 2: 编译验证** → SUCCESS
 
-- [ ] **Step 5: 提交**
-
-```bash
-git add ddd-dubbo-app
-git commit -m "feat(app): 订单 Provider 实现 + 启动类 + application.yml"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(app): Provider + 启动类 + OutboxRelay + MQ 模板"`
 
 ---
 
-## Task 17: job 模块（JobStartApplication + AbstractTask）
+## Task 19: job 模块（AbstractTask 用 OTel root span）
 
 **Files:**
-- Create: `ddd-dubbo-job/src/main/java/com/ddd/dubbo/job/JobStartApplication.java`
-- Create: `ddd-dubbo-job/src/main/java/com/ddd/dubbo/job/task/AbstractTask.java`
-- Create: `ddd-dubbo-job/src/main/resources/application.yml`
+- `ddd-dubbo-job/src/main/java/com/ddd/dubbo/job/JobStartApplication.java`
+- `ddd-dubbo-job/src/main/java/com/ddd/dubbo/job/task/AbstractTask.java`
+- `ddd-dubbo-job/src/main/resources/application.yml`
 
-- [ ] **Step 1: 实现**
+- [ ] **Step 1: 实现（OTel root span，非 UUID）**
 
 ```java
 package com.ddd.dubbo.job;
@@ -2638,7 +1849,6 @@ package com.ddd.dubbo.job;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
-/** Job 独立进程启动入口（复用 domain/infra，不暴露 Dubbo Provider） */
 @SpringBootApplication(scanBasePackages = "com.ddd.dubbo")
 public class JobStartApplication {
     public static void main(String[] args) {
@@ -2652,29 +1862,42 @@ package com.ddd.dubbo.job.task;
 
 import com.xxl.job.core.handler.annotation.XxlJob;
 import com.xxl.job.core.handler.XxlJobHelper;
+import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
-import java.util.UUID;
-
-/** XXL-Job 任务基类：入口统一初始化 traceId 写 MDC，结束清理 */
+/** XXL-Job 任务基类：手动建 OTel root span，traceId 写 MDC */
 public abstract class AbstractTask {
 
     private static final Logger log = LoggerFactory.getLogger(AbstractTask.class);
+    private static final Tracer TRACER = GlobalOpenTelemetry.getTracer("ddd-dubbo-job");
 
     @XxlJob("taskHandler")
     public void execute() {
-        String traceId = UUID.randomUUID().toString().replace("-", "");
-        MDC.put("traceId", traceId);
-        try {
+        String taskName = getClass().getSimpleName();
+        Span span = TRACER.spanBuilder("job." + taskName)
+                .setSpanKind(SpanKind.INTERNAL)
+                .setAttribute("job.name", taskName)
+                .startSpan();
+        try (Scope scope = span.makeCurrent()) {
+            MDC.put("traceId", span.getSpanContext().getTraceId());
             doExecute();
             XxlJobHelper.handleSuccess();
+            span.setStatus(StatusCode.OK);
         } catch (Exception e) {
             log.error("任务执行失败", e);
+            span.recordException(e);
+            span.setStatus(StatusCode.ERROR, e.getMessage());
             XxlJobHelper.handleFail(e.getMessage());
         } finally {
-            MDC.clear();
+            MDC.remove("traceId");
+            span.end();
         }
     }
 
@@ -2682,13 +1905,10 @@ public abstract class AbstractTask {
 }
 ```
 
-- [ ] **Step 2: application.yml**
-
 ```yaml
 spring:
   application:
     name: ddd-dubbo-job
-
 xxl:
   job:
     admin:
@@ -2698,198 +1918,49 @@ xxl:
       port: 9999
 ```
 
-- [ ] **Step 3: 编译验证** → `mvn -q -pl ddd-dubbo-job -am compile` → SUCCESS
+- [ ] **Step 2: 编译验证** → SUCCESS
 
-- [ ] **Step 4: 提交**
-
-```bash
-git add ddd-dubbo-job
-git commit -m "feat(job): JobStartApplication + XXL-Job 任务基类 AbstractTask"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(job): JobStartApplication + AbstractTask（OTel root span）"`
 
 ---
 
-## Task 18: RocketMQ 生产/消费模板 + 幂等
+## Task 20: 异步导出（AbstractExportTask + ObjectStorageWriter）
 
 **Files:**
-- Create: `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/mq/{MqProducerTemplate,IdempotentHelper}.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/export/ExportRequest.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/export/ObjectStorageWriter.java`
+- `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/export/AbstractExportTask.java`
 
-- [ ] **Step 1: 实现（编译验证，中间件集成测试后置）**
+（代码同上一版计划 Task 19，`ExportRequest` 含 taskId/bizType）
 
-```java
-package com.ddd.dubbo.app.mq;
+- [ ] **Step 1-2: 实现 + 编译** → SUCCESS
 
-import org.apache.rocketmq.spring.core.RocketMQTemplate;
-import org.apache.rocketmq.spring.support.RocketMQHeaders;
-import org.springframework.messaging.support.MessageBuilder;
-import org.springframework.stereotype.Component;
-
-import javax.annotation.Resource;
-
-/** RocketMQ 生产者模板 */
-@Component
-public class MqProducerTemplate {
-
-    @Resource
-    private RocketMQTemplate rocketMQTemplate;
-
-    /** 发送普通消息 */
-    public void send(String topic, Object payload) {
-        rocketMQTemplate.convertAndSend(topic, payload);
-    }
-
-    /** 发送延时消息（delayLevel：1~18） */
-    public void sendDelay(String topic, Object payload, int delayLevel) {
-        rocketMQTemplate.syncSend(topic,
-                MessageBuilder.withPayload(payload)
-                        .setHeader(RocketMQHeaders.KEYS, String.valueOf(System.currentTimeMillis()))
-                        .build(),
-                3000, delayLevel);
-    }
-}
-```
-
-```java
-package com.ddd.dubbo.app.mq;
-
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Component;
-
-import javax.annotation.Resource;
-import java.util.concurrent.TimeUnit;
-
-/** 幂等辅助：messageId + Redis setnx 去重 */
-@Component
-public class IdempotentHelper {
-
-    @Resource
-    private StringRedisTemplate stringRedisTemplate;
-
-    public boolean tryConsume(String messageId) {
-        Boolean ok = stringRedisTemplate.opsForValue()
-                .setIfAbsent("idempotent:" + messageId, "1", 24, TimeUnit.HOURS);
-        return Boolean.TRUE.equals(ok);
-    }
-
-    public void complete(String messageId) {
-        stringRedisTemplate.opsForValue().set("idempotent:" + messageId + ":done", "1", 24, TimeUnit.HOURS);
-    }
-}
-```
-
-> 注：`IdempotentHelper` 依赖 `StringRedisTemplate`，需在 app POM 添加 `spring-boot-starter-data-redis` 依赖。执行时若编译报错，在 `ddd-dubbo-app/pom.xml` 增加：
-> ```xml
-> <dependency>
->     <groupId>org.springframework.boot</groupId>
->     <artifactId>spring-boot-starter-data-redis</artifactId>
-> </dependency>
-> ```
-
-- [ ] **Step 2: 编译验证** → `mvn -q -pl ddd-dubbo-app -am compile` → SUCCESS
-
-- [ ] **Step 3: 提交**
-
-```bash
-git add ddd-dubbo-app
-git commit -m "feat(app): RocketMQ 生产模板 + 幂等辅助"
-```
+- [ ] **Step 3: 提交** → `git commit -m "feat(app): 异步导出任务基类（V1 简化版）"`
 
 ---
 
-## Task 19: 异步导出 starter（AbstractExportTask + ObjectStorageWriter）
+## Task 21: 全量编译 + 测试 + 收尾
 
-**Files:**
-- Create: `ddd-dubbo-app/src/main/java/com/ddd/dubbo/app/export/{ObjectStorageWriter,AbstractExportTask}.java`
-
-- [ ] **Step 1: 实现（编译验证）**
-
-```java
-package com.ddd.dubbo.app.export;
-
-import java.io.File;
-
-/** 对象存储写入（导出文件服务端上传的最小能力） */
-public interface ObjectStorageWriter {
-    String upload(String directory, File file);
-}
-```
-
-```java
-package com.ddd.dubbo.app.export;
-
-/** 异步导出任务基类：分页查询 + 流式写文件 + 上传，防止 OOM */
-public abstract class AbstractExportTask<T> {
-
-    private final ObjectStorageWriter objectStorageWriter;
-
-    protected AbstractExportTask(ObjectStorageWriter objectStorageWriter) {
-        this.objectStorageWriter = objectStorageWriter;
-    }
-
-    public String execute(ExportRequest request) {
-        File file = streamWrite(request);
-        return objectStorageWriter.upload(request.getBizType(), file);
-    }
-
-    /** 分页查询 + 流式写文件（子类实现，避免一次性加载全部数据） */
-    protected abstract File streamWrite(ExportRequest request);
-}
-```
-
-> 注：`ExportRequest` 为导出请求模型，需一并创建：
-> ```java
-> package com.ddd.dubbo.app.export;
->
-> public class ExportRequest {
->     private String taskId;
->     private String bizType;
->     public String getTaskId() { return taskId; }
->     public void setTaskId(String taskId) { this.taskId = taskId; }
->     public String getBizType() { return bizType; }
->     public void setBizType(String bizType) { this.bizType = bizType; }
-> }
-> ```
-
-- [ ] **Step 2: 编译验证** → `mvn -q -pl ddd-dubbo-app -am compile` → SUCCESS
-
-- [ ] **Step 3: 提交**
-
-```bash
-git add ddd-dubbo-app
-git commit -m "feat(app): 异步导出任务基类 AbstractExportTask"
-```
-
----
-
-## Task 20: 全量编译 + 测试 + 收尾
-
-- [ ] **Step 1: 全量测试**
-
-Run: `mvn -q clean test`
-Expected: 全部单测 PASS（ResultTest / BizExceptionTest / CommandBusTest / ExtensionExecutorTest / StateMachineTest / UserContextTest / LockUtilTest / OrderServiceTest）
-
-- [ ] **Step 2: 全量打包**
-
-Run: `mvn -q clean package -DskipTests`
-Expected: BUILD SUCCESS
-
-- [ ] **Step 3: 修复任何编译/测试问题**
-
-若某模块编译失败（如缺依赖、import 错误、泛型不一致），定位并修复，重新运行 Step 1/2 直到通过。
-
+- [ ] **Step 1: 全量测试** → `mvn -q clean test` → 全部单测 PASS
+- [ ] **Step 2: 全量打包** → `mvn -q clean package -DskipTests` → BUILD SUCCESS
+- [ ] **Step 3: 修复遗留编译/测试问题**（缺依赖、import、泛型不一致）
 - [ ] **Step 4: 最终提交**
 
 ```bash
 git add -A
-git commit -m "feat: ddd-dubbo 框架完整实现（五模块 + 用例执行器 + 扩展点 + 状态机 + 公共能力 + 示例业务）"
+git commit -m "feat: ddd-dubbo V1 完整实现（五模块 + 用例执行器 + 扩展点 + 状态机 + Assert + Outbox + OTel + 时区 + 示例业务）"
 ```
 
 ---
 
-## 自审清单（写计划后自查）
+## 自审清单
 
-1. **Spec 覆盖**：详设第 18 章 16 步 → 本计划 Task 1-20 全覆盖（骨架/Result/异常/用例执行器/扩展点/状态机/Provider/上下文/数据访问/缓存锁/MQ/调度/线程池/领域事件/导出/示例业务/SDK 骨架）。SDK 拆分（详设第 15 章）因涉及独立 starter 模块打包，V1 以 `@ConditionalOnProperty` 装配能力开关的形式落在 app 配置类中，未单独建 starter 模块（符合「纯公共能力 + 条件装配」目标，避免过度拆分）。
-2. **占位符扫描**：无 TBD/TODO/“类似 Task N”；每个代码步骤含完整代码。
-3. **类型一致性**：`Order` 状态枚举为 `Order.OrderStatus`（实体内部），状态机枚举 `OrderStatus`（order.statemachine 包）与实体内部枚举重名——执行时请注意：领域规则用 `Order.OrderStatus`，状态机用 `com.ddd.dubbo.domain.order.statemachine.OrderStatus`。若混淆，统一状态机枚举为唯一来源（推荐：删除实体内部枚举，统一 import statemachine.OrderStatus）。
+1. **Spec 覆盖**：框架详细设计 + 统一异常Demo(Assert/包结构) + 分布式事务Demo(Outbox) + 时区指南(TimeZoneUtils/Long) + OpenTelemetry(OTel traceId) + 面试总结(immutable UserContext) 全部落地；**分片上传下载（common-file）→ V2 明确后置**（见附录）；国际化 → V2 后置（面试总结明确）。
+2. **类型一致性**：`Order.status` 用 String 存枚举名，状态枚举唯一来源 `com.ddd.dubbo.domain.order.statemachine.OrderStatus`；时间字段全 `Long` UTC；`CreateOrderCommand`/`QueryOrderCommand` 泛型为 `Command<Order>`/`Query<Order>`；`Result` 在 `api.result`，`ErrorCode` 在 `domain.common.exception`。
+3. **依赖方向**：domain 依赖 api + otel-api；infra 依赖 domain；app 依赖 domain+infra；job 依赖 domain+infra。Outbox 仓储接口在 domain、实现+Mapper 在 infra、投递器在 app，方向正确。
 
-> **执行提示**：Task 12 中 `CreateOrderCommand`/`QueryOrderCommand` 泛型最终为 `Command<Order>`/`Query<Order>`（返回领域对象，Resp 组装在 Provider 层），执行时务必一致。
+## 附录：V2 待实施（不在本计划）
+
+- **分片上传下载能力（common-file）**：`ObjectStorageGateway` + S3 实现 + 分片会话/5 张表/状态机/3 个 Provider（详见 `docs/Dubbo通用分片上传下载能力详细设计方案.md`）。
+- **国际化**：`MessageSourceHandler`/`I18nUtils`/`ErrorCodeSpec`（异常存 messageKey 懒翻译，详见面试总结第 9 节）。
+- **多数据源**：单数据源预留范式，第二版复制配置类改前缀。
