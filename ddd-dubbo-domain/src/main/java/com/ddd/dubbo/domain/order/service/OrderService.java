@@ -21,7 +21,7 @@ public class OrderService {
         Order order = new Order();
         order.setUserId(userId);
         order.setAmount(amount);
-        order.setStatus(OrderStatus.INIT.name());
+        order.setStatus(OrderStatus.INIT);
         order.setCreatedAt(TimeZoneUtils.getCurrentUtcTimestamp());
         order.setUpdatedAt(order.getCreatedAt());
         return order;

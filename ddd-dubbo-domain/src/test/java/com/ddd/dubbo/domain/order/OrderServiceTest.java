@@ -18,7 +18,7 @@ class OrderServiceTest {
         Order order = service.createOrder(100L, new BigDecimal("50"));
         assertEquals(Long.valueOf(100L), order.getUserId());
         assertEquals(new BigDecimal("50"), order.getAmount());
-        assertEquals(OrderStatus.INIT.name(), order.getStatus());
+        assertEquals(OrderStatus.INIT, order.getStatus());
         assertNotNull(order.getCreatedAt());
     }
 
