@@ -5,7 +5,7 @@ import com.ddd.dubbo.api.order.model.req.CreateOrderReq;
 import com.ddd.dubbo.api.order.model.req.QueryOrderReq;
 import com.ddd.dubbo.api.order.model.resp.OrderResp;
 import com.ddd.dubbo.api.order.provider.OrderProvider;
-import com.ddd.dubbo.domain.common.exception.ExceptionAnnotation;
+import com.ddd.dubbo.app.config.exception.ExceptionAnnotation;
 import com.ddd.dubbo.domain.exe.CommandBus;
 import com.ddd.dubbo.domain.exe.QueryBus;
 import com.ddd.dubbo.domain.order.command.CreateOrderCommand;

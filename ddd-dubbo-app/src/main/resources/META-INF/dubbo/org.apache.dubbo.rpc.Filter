@@ -1,0 +1,2 @@
+dubboProviderFilter=com.ddd.dubbo.app.config.filter.DubboProviderFilter
+dubboConsumerFilter=com.ddd.dubbo.app.config.filter.DubboConsumerFilter

@@ -1,4 +1,4 @@
-package com.ddd.dubbo.domain.common.exception;
+package com.ddd.dubbo.app.config.exception;
 
 import java.lang.annotation.*;
 

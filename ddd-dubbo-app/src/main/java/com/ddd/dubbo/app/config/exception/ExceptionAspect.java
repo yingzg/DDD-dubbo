@@ -1,7 +1,8 @@
-package com.ddd.dubbo.domain.common.exception;
+package com.ddd.dubbo.app.config.exception;
 
 import com.ddd.dubbo.api.result.Result;
 import com.ddd.dubbo.domain.common.context.TraceContext;
+import com.ddd.dubbo.domain.common.exception.BizException;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
@@ -17,7 +18,7 @@ public class ExceptionAspect {
     private static final Logger log = LoggerFactory.getLogger(ExceptionAspect.class);
     private static final int SYS_ERROR_CODE = 5000;
 
-    @Around("@within(com.ddd.dubbo.domain.common.exception.ExceptionAnnotation) " +
+    @Around("@within(com.ddd.dubbo.app.config.exception.ExceptionAnnotation) " +
             "&& @within(org.apache.dubbo.config.annotation.DubboService)")
     public Object handle(ProceedingJoinPoint pjp) {
         try {
