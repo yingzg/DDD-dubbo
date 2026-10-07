@@ -1,6 +1,12 @@
 spring:
   application:
     name: ddd-dubbo-job
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/ddd_dubbo?useUnicode=true&characterEncoding=utf8&serverTimezone=UTC
+    username: root
+    password: root
+    type: com.alibaba.druid.pool.DruidDataSource
 xxl:
   job:
     admin:

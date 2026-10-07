@@ -1,4 +1,4 @@
-package com.ddd.dubbo.domain.common.threadpool;
+package com.ddd.dubbo.app.config.threadpool;
 
 import com.alibaba.ttl.threadpool.TtlExecutors;
 import org.springframework.context.annotation.Bean;

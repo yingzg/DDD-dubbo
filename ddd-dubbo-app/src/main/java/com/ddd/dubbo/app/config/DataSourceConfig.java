@@ -13,7 +13,7 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import javax.sql.DataSource;
 
 @Configuration
-@MapperScan(basePackages = "com.ddd.dubbo.infra.**.mapper")
+@MapperScan("com.ddd.dubbo.infra")
 public class DataSourceConfig {
 
     @Bean

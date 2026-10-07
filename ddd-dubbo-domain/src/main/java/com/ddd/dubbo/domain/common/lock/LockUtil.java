@@ -3,11 +3,13 @@ package com.ddd.dubbo.domain.common.lock;
 import com.ddd.dubbo.domain.common.exception.BizException;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
+import org.springframework.stereotype.Component;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /** 分布式锁工具（Redisson） */
+@Component
 public class LockUtil {
 
     private static final int LOCK_TIMEOUT = 5003;
